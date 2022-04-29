@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import numpy as np
 
 import pytorch_lightning as pl
 import wandb
@@ -123,10 +124,10 @@ class LightningMultiAutoencoderNetwork(LightningAutoencoderNetwork):
 
 class LightningJointMultiAutoencoderNetwork(LightningMultiAutoencoderNetwork):
 
-    def __init__(self, input_shape, output_shape, num_layers, hidden_size):
+    def __init__(self, input_shape, output_shape, num_layers, latent_size, hidden_size):
         super(LightningJointMultiAutoencoderNetwork, self).__init__(input_shape, input_shape, num_layers, hidden_size)
-        self.network = MultiAutoencoderNetwork(input_shape, hidden_size)
-        self.classify_network = Network(hidden_size, output_shape, num_layers, hidden_size)
+        self.network = MultiAutoencoderNetwork(input_shape, latent_size)
+        self.classify_network = Network(latent_size, output_shape, num_layers, hidden_size)
         self.loss = nn.MSELoss()
         self.classify_loss = nn.BCELoss()
         self.decoder_index = 0
@@ -135,23 +136,45 @@ class LightningJointMultiAutoencoderNetwork(LightningMultiAutoencoderNetwork):
         self.decoder_index = decoder_index
 
     def forward(self, inputs):
-        current_input, decoder_index = inputs
-        if type(current_input) != torch.Tensor:
-            current_input = torch.from_numpy(current_input)
-        mean, log_var, encoded_output, reconstructed_output = self.network(current_input, self.decoder_index)
-        return reconstructed_output
+        current_inputs, decoder_index = inputs
+        if type(current_inputs) != torch.Tensor:
+            current_inputs = torch.from_numpy(current_inputs)
+
+        reconstructed_outputs = None
+        outputs = None
+
+        if current_inputs.shape[0] == 1:
+            mean, log_var, encoded_output, reconstructed_output = self.network(current_inputs, self.decoder_index)
+            output = self.classify_network(encoded_output)
+            reconstructed_outputs = reconstructed_output
+            outputs = output
+        else:
+            for i in range(current_inputs.shape[0]):
+                current_input = current_inputs[i].unsqueeze(0)
+                current_decoder_index = decoder_index[i].item()
+                mean, log_var, encoded_output, reconstructed_output = self.network(current_input, current_decoder_index)
+                output = self.classify_network(encoded_output)
+
+                if reconstructed_outputs is None:
+                    reconstructed_outputs = reconstructed_output
+                    outputs = output
+                else:
+                    reconstructed_outputs = torch.cat([reconstructed_outputs, reconstructed_output])
+                    outputs = torch.cat([outputs, output])
+
+        return reconstructed_outputs, outputs
 
     def get_encoded_features(self, inputs):
         mean, log_var, latent = self.network.get_encoded_features(inputs)
         return latent
 
     def training_step(self, train_batch, batch_index):
-        x, y = train_batch
+        x, decoder_index, y = train_batch
         # make sure batch size is one because this only work with one batch size since we have many decoders
         assert x.shape[0] == 1
 
-        mean, log_var, encoded_output, reconstructed_output = self.network(x, self.decoder_index)
-        output = self.classify_network(encoded_output)
+        mean, log_var, encoded_output, reconstructed_output = self.network(x, decoder_index.item())
+        output = torch.sigmoid(self.classify_network(encoded_output))
         reconstruction_loss = self.loss(reconstructed_output, x)
         output_loss = self.classify_loss(output, y)
         kld_loss = - 0.5 * torch.sum(1+ log_var - mean.pow(2) - log_var.exp())
@@ -159,15 +182,19 @@ class LightningJointMultiAutoencoderNetwork(LightningMultiAutoencoderNetwork):
 
         self.log('train_autoencoder_loss', reconstruction_loss + kld_loss)
         self.log('train_output_loss', output_loss)
+        self.log('train_loss', loss)
 
         wandb.log({"train_autoencoder_loss": reconstruction_loss + kld_loss,
-                   "train_output_loss": output_loss})
+                   "train_output_loss": output_loss,
+                   "train_loss": loss})
         return loss
 
     def validation_step(self, val_batch, batch_index):
-        x, y = val_batch
-        mean, log_var, encoded_output, reconstructed_output = self.network(x, self.decoder_index)
-        output = self.classify_network(encoded_output)
+        x, decoder_index, y = val_batch
+        # make sure batch size is one because this only work with one batch size since we have many decoders
+        assert x.shape[0] == 1
+        mean, log_var, encoded_output, reconstructed_output = self.network(x, decoder_index.item())
+        output = torch.sigmoid(self.classify_network(encoded_output))
         reconstruction_loss = self.loss(reconstructed_output, x)
         kld_loss = - 0.5 * torch.sum(1+ log_var - mean.pow(2) - log_var.exp())
         output_loss = self.classify_loss(output, y)
@@ -176,9 +203,11 @@ class LightningJointMultiAutoencoderNetwork(LightningMultiAutoencoderNetwork):
 
         self.log('val_autoencoder_loss', reconstruction_loss + kld_loss)
         self.log('val_output_loss', output_loss)
+        self.log('val_loss', loss)
 
         wandb.log({"val_autoencoder_loss": reconstruction_loss + kld_loss,
-                   "val_output_loss": output_loss})
+                   "val_output_loss": output_loss,
+                   "val_loss": loss})
 
         return loss
 
