@@ -48,10 +48,23 @@ class LightningNetwork(pl.LightningModule):
 
 class LightningAutoencoderNetwork(LightningNetwork):
 
-    def __init__(self, input_shape, output_shape, num_layers, hidden_size):
+    def __init__(self, input_shape, output_shape, condition_latent_size, num_layers, hidden_size, network_type='normal'):
+        # network_type can be 'normal' or 'conditional'
         super(LightningAutoencoderNetwork, self).__init__(input_shape, output_shape, num_layers, hidden_size)
-        self.network = AutoencoderNetwork(input_shape, output_shape, hidden_size)
+
+        networks_dict = {
+            'conditional': lambda: ConditionalNetwork(input_shape, condition_latent_size, output_shape, hidden_size),
+            'normal': lambda: AutoencoderNetwork(input_shape, output_shape, hidden_size)
+        }
+
+        self.network_type = network_type
+        self.network = networks_dict[network_type]()
         self.loss = nn.L1Loss()
+
+    def get_encoded_features(self, inputs):
+        if type(inputs) != torch.Tensor:
+            inputs = torch.from_numpy(inputs)
+        return self.network.get_encoded_features(inputs)
 
     def forward(self, inputs):
         if type(inputs) != torch.Tensor:
@@ -59,21 +72,103 @@ class LightningAutoencoderNetwork(LightningNetwork):
         return self.network(inputs)
 
     def training_step(self, train_batch, batch_index):
-        x, y = train_batch
-        encoded_output, reconstructed_output = self.network(x)
-        loss = self.loss(reconstructed_output, x)
+        x, onehot_decoder_indexes, y = train_batch
+
+        if self.network_type == 'conditional':
+            mean, log_var, encoded_output, reconstructed_output = self.network([onehot_decoder_indexes, x])
+        else:
+            mean, log_var, encoded_output, reconstructed_output = self.network(x)
+
+        reconstruction_loss = self.loss(reconstructed_output, x)
+        kld_loss = - 0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
+        loss = reconstruction_loss + kld_loss
+        # output_loss = self.classify_loss(output, y)
+
         self.log('train_autoencoder_loss', loss)
 
         wandb.log({"train_autoencoder_loss": loss})
         return loss
 
     def validation_step(self, val_batch, batch_index):
-        x, y = val_batch
-        encoded_output, reconstructed_output = self.network(x)
-        loss = self.loss(reconstructed_output, x)
+        x, onehot_decoder_indexes, y = val_batch
+        mean, log_var, encoded_output, reconstructed_output = self.network([onehot_decoder_indexes, x])
+
+        reconstruction_loss = self.loss(reconstructed_output, x)
+        kld_loss = - 0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
+        loss = reconstruction_loss + kld_loss
         self.log('val_autoencoder_loss', loss)
 
         wandb.log({"val_autoencoder_loss": loss})
+        return loss
+
+
+class LightningJointAutoencoderNetwork(LightningNetwork):
+
+    def __init__(self, input_shape, output_shape, condition_latent_size, num_layers, hidden_size, network_type='normal'):
+        # network_type can be 'normal' or 'conditional'
+        super(LightningJointAutoencoderNetwork, self).__init__(input_shape, output_shape, num_layers, hidden_size)
+
+        networks_dict = {
+            'conditional': lambda: ConditionalNetwork(input_shape, condition_latent_size, output_shape, hidden_size),
+            'normal': lambda: AutoencoderNetwork(input_shape, output_shape, hidden_size)
+        }
+
+        self.network_type = network_type
+        self.network = networks_dict[network_type]()
+        self.classify_network = Network(hidden_size+condition_latent_size, output_shape, num_layers, hidden_size)
+        self.loss = nn.L1Loss()
+
+    def get_encoded_features(self, inputs):
+        if type(inputs) != torch.Tensor:
+            inputs = torch.from_numpy(inputs)
+        return self.network.get_encoded_features(inputs)
+
+    def forward(self, inputs):
+        if type(inputs) != torch.Tensor:
+            inputs = torch.from_numpy(inputs)
+        return self.network(inputs)
+
+    def training_step(self, train_batch, batch_index):
+        x, onehot_decoder_indexes, y = train_batch
+
+        if self.network_type == 'conditional':
+            mean, log_var, encoded_output, reconstructed_output = self.network([onehot_decoder_indexes, x])
+            encoded_output = self.network.combine_onehot_and_encoded_feature(onehot_decoder_indexes, encoded_output)
+        else:
+            mean, log_var, encoded_output, reconstructed_output = self.network(x)
+
+        reconstruction_loss = self.loss(reconstructed_output, x)
+        kld_loss = - 0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
+        loss = reconstruction_loss + kld_loss
+
+        output = self.classify_network(encoded_output)
+        output_loss = self.classify_loss(output, y)
+        loss = loss + output_loss
+
+        self.log('train_autoencoder_loss', reconstruction_loss + kld_loss)
+        self.log('train_output_loss', output_loss)
+        self.log('train_total_loss', loss)
+
+        wandb.log({"train_autoencoder_loss": loss, 'train_output_loss': output_loss, 'train_total_loss': loss})
+        return loss
+
+    def validation_step(self, val_batch, batch_index):
+        x, onehot_decoder_indexes, y = val_batch
+        mean, log_var, encoded_output, reconstructed_output = self.network([onehot_decoder_indexes, x])
+
+        reconstruction_loss = self.loss(reconstructed_output, x)
+        kld_loss = - 0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
+        loss = reconstruction_loss + kld_loss
+
+        output = self.classify_network(encoded_output)
+        output_loss = self.classify_loss(output, y)
+        loss = loss + output_loss
+
+        self.log('val_autoencoder_loss', reconstruction_loss + kld_loss)
+        self.log('val_output_loss', output_loss)
+        self.log('val_total_loss', loss)
+
+        wandb.log({"val_autoencoder_loss": loss, 'val_output_loss': output_loss, 'val_total_loss': loss})
         return loss
 
 
@@ -131,6 +226,7 @@ class LightningJointMultiAutoencoderNetwork(LightningMultiAutoencoderNetwork):
         self.loss = nn.MSELoss()
         self.classify_loss = nn.BCELoss()
         self.decoder_index = 0
+        self.train_recons = True
 
     def set_decoder_index(self, decoder_index):
         self.decoder_index = decoder_index
@@ -169,24 +265,31 @@ class LightningJointMultiAutoencoderNetwork(LightningMultiAutoencoderNetwork):
         return latent
 
     def training_step(self, train_batch, batch_index):
+        if self.global_step % 50 == 0:
+            self.train_recons = not self.train_recons
+
         x, decoder_index, y = train_batch
         # make sure batch size is one because this only work with one batch size since we have many decoders
         assert x.shape[0] == 1
 
         mean, log_var, encoded_output, reconstructed_output = self.network(x, decoder_index.item())
         output = torch.sigmoid(self.classify_network(encoded_output))
-        reconstruction_loss = self.loss(reconstructed_output, x)
-        output_loss = self.classify_loss(output, y)
-        kld_loss = - 0.5 * torch.sum(1+ log_var - mean.pow(2) - log_var.exp())
-        loss = reconstruction_loss + kld_loss + output_loss
+        if self.train_recons:
+            reconstruction_loss = self.loss(reconstructed_output, x)
+            kld_loss = - 0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
+            loss = reconstruction_loss + kld_loss
+            self.log('train_autoencoder_loss', reconstruction_loss + kld_loss)
+            self.log('train_loss', loss)
+            wandb.log({"train_autoencoder_loss": reconstruction_loss + kld_loss,
+                       "train_loss": loss})
 
-        self.log('train_autoencoder_loss', reconstruction_loss + kld_loss)
-        self.log('train_output_loss', output_loss)
-        self.log('train_loss', loss)
+        if not self.train_recons:
+            output_loss = self.classify_loss(output, y)
+            loss = output_loss
+            self.log('train_output_loss', output_loss)
+            wandb.log({"train_output_loss": output_loss,
+                       "train_loss": loss})
 
-        wandb.log({"train_autoencoder_loss": reconstruction_loss + kld_loss,
-                   "train_output_loss": output_loss,
-                   "train_loss": loss})
         return loss
 
     def validation_step(self, val_batch, batch_index):
@@ -268,6 +371,8 @@ class AutoencoderNetwork(nn.Module):
         encoder = [nn.Linear(input_shape, 2 * hidden_size), nn.ReLU(), nn.Dropout(0.5),
                    nn.Linear(2 * hidden_size, hidden_size), nn.ReLU(), nn.Dropout(0.5)]
         self.encoder = nn.Sequential(*encoder)
+        self.mean_layer = nn.Linear(hidden_size, hidden_size)
+        self.log_var_layer = nn.Linear(hidden_size, hidden_size)
 
         decoder = [nn.Linear(hidden_size, 2 * hidden_size), nn.ReLU(), nn.Dropout(0.5),
                    nn.Linear(2 * hidden_size, input_shape)]
@@ -277,10 +382,50 @@ class AutoencoderNetwork(nn.Module):
         # loss
         self.loss = nn.BCELoss()
 
+    def reparameterization(self, mean, log_var):
+        epsilon = torch.randn_like(log_var)
+        z = mean + log_var * epsilon
+        return z
+
+    def get_encoded_features(self, inputs):
+        encoded = self.encoder(inputs)
+        mean, log_var = self.mean_layer(encoded), self.log_var_layer(encoded)
+        return mean, log_var, self.reparameterization(mean, log_var)
+
     def forward(self, inputs):
-        encoded_output = self.encoder(inputs)
+        mean, log_var, encoded_output = self.get_encoded_features(inputs)
+        reconstructed_output = self.decoders(encoded_output)
+        return mean, log_var, encoded_output, reconstructed_output
+
+
+class ConditionalNetwork(AutoencoderNetwork):
+    def __init__(self, input_shape, condition_latent_size, output_shape, hidden_size):
+        super(ConditionalNetwork, self).__init__(input_shape, output_shape, hidden_size)
+        self.condition_latent_size = condition_latent_size
+
+        encoder = [nn.Linear(input_shape, 2 * hidden_size), nn.ReLU(), nn.Dropout(0.5),
+                   nn.Linear(2 * hidden_size, hidden_size), nn.ReLU(), nn.Dropout(0.5)]
+        self.encoder = nn.Sequential(*encoder)
+        self.mean_layer = nn.Linear(hidden_size, hidden_size)
+        self.log_var_layer = nn.Linear(hidden_size, hidden_size)
+
+        decoder = [nn.Linear(hidden_size + condition_latent_size, 2 * hidden_size), nn.ReLU(), nn.Dropout(0.5),
+                   nn.Linear(2 * hidden_size, input_shape)]
+        self.decoder = nn.Sequential(*decoder)
+        self.optim = torch.optim.Adam(list(self.encoder.parameters()) + list(self.decoder.parameters()))
+
+        # loss
+        self.loss = nn.BCELoss()
+
+    def combine_onehot_and_encoded_feature(self, condition_latents, encoded_outputs):
+        return torch.cat([condition_latents, encoded_outputs], 1)
+
+    def forward(self, inputs):
+        condition_latents, current_inputs = inputs
+        mean, log_var, encoded_output = self.get_encoded_features(current_inputs)
+        encoded_output = self.combine_onehot_and_encoded_feature(condition_latents, encoded_output)
         reconstructed_output = self.decoder(encoded_output)
-        return encoded_output, reconstructed_output
+        return mean, log_var, encoded_output, reconstructed_output
 
 
 class Network(nn.Module):

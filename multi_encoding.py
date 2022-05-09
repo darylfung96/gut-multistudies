@@ -33,7 +33,7 @@ else:
 autoencoder_latent_shape = 128
 hidden_size = 64
 unique_labels = np.unique(data.values[:, 2])
-is_impute = True
+is_impute = False
 imputer = IterativeImputer(max_iter=10, random_state=0, missing_values=0)
 
 features = data.values[:, 3:].astype(np.float32)
@@ -46,7 +46,7 @@ encoded_labels = label_encoder.fit_transform(labels).toarray().astype(np.float32
 autoencoder_network = LightningJointMultiAutoencoderNetwork(features.shape[1], encoded_labels.shape[1], 2,
                                                             autoencoder_latent_shape, hidden_size)
 # create different decoders for different study name
-wandb.init(name=f'wasif_data_multi_decoder_endtoend', project='wasif_data', group=f'endtoend vae {current_dataset} {type_data} '
+wandb.init(name=f'wasif_data_multi_decoder_endtoend', project='wasif_data', group=f'separate endtoend vae {current_dataset} {type_data} '
                                                                          f'{"impute" if is_impute else ""}'
                                                                          f'latent:{autoencoder_latent_shape} '
                                                                          f'hidden: {hidden_size}', reinit=True)
@@ -97,7 +97,8 @@ for idx, (train_index, val_index) in enumerate(folds.split(current_data, encoded
     random.seed(100)
     torch.random.manual_seed(100)
     wandb.watch(autoencoder_network, log_freq=5)
-    trainer = pl.Trainer(max_epochs=200, callbacks=[EarlyStopping(monitor="val_loss")])
+    # trainer = pl.Trainer(max_epochs=200, callbacks=[EarlyStopping(monitor="val_loss")])
+    trainer = pl.Trainer(max_epochs=200)
 
     train_tensor_scaled_features = torch.from_numpy(current_data[train_index])
     train_decoder_index = torch.from_numpy(decoder_indexes[train_index])
