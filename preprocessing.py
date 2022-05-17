@@ -39,6 +39,13 @@ encoded_labels = label_encoder.fit_transform(labels).toarray().astype(np.float32
 
 
 unique_labels = np.unique(data.values[:, 2])
+
+
+def get_index_of_label_in_dataset(current_label):
+    test_index = np.where(data.values[:, 2] == current_label)[0]
+    train_index = np.where(data.values[:, 2] != current_label)[0]
+    return train_index, test_index
+
 # for unique_label in unique_labels:
 #     wandb.init(name=unique_label, project='wasif_data', group=f'before correction: {current_dataset} {type_data}', reinit=True)
 #     pca = PCA(2)

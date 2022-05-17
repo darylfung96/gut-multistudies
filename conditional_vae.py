@@ -14,7 +14,7 @@ from sklearn import metrics
 import matplotlib.pyplot as plt
 import wandb
 
-from network import LightningNetwork, LightningAutoencoderNetwork
+from network import LightningJointAutoencoderNetwork
 
 wandb.login()
 
@@ -29,8 +29,9 @@ elif current_dataset == 'plaque':
 else:
     raise Exception('Use either "joined" or "plaque" for current_dataset.')
 
-autoencoder_latent_shape = 128
-hidden_size = 128
+autoencoder_latent_shape = 16
+hidden_size = 256
+num_layers = 4
 features = data.values[:, 3:].astype(np.float32)
 scaler = StandardScaler()
 scaled_features = scaler.fit_transform(features)
@@ -54,8 +55,9 @@ for idx, current_data in enumerate(all_data):
     y_true_list = None
     pred_list = None
 
-    wandb.init(name=f'wasif_data_conditional_separate', project='wasif_data', group=f'conditional vae {current_dataset} {type_data} '
+    wandb.init(name=f'wasif_data_conditional_joint', project='wasif_data', group=f'conditional vae joint {current_dataset} {type_data} '
                                                                          f'{"impute" if is_impute else ""}'
+                                                                         f'num layers: {num_layers} '
                                                                          f'latent:{autoencoder_latent_shape} '
                                                                          f'hidden: {hidden_size}', reinit=True)
     for idx, (train_index, val_index) in enumerate(folds.split(current_data, encoded_labels)):
@@ -63,48 +65,36 @@ for idx, current_data in enumerate(all_data):
         np.random.seed(100)
         random.seed(100)
         torch.random.manual_seed(100)
-        autoencoder_network = LightningAutoencoderNetwork(features.shape[1], encoded_labels.shape[1],
-                                                          one_hot_decoder_indexes.shape[1], 2, autoencoder_latent_shape,
+        network = LightningJointAutoencoderNetwork(features.shape[1], encoded_labels.shape[1],
+                                                          one_hot_decoder_indexes.shape[1], num_layers, autoencoder_latent_shape,
                                                           'conditional')
-        wandb.watch(autoencoder_network)
-        autoencoder_trainer = pl.Trainer(max_epochs=200)
-        tensor_scaled_features = torch.from_numpy(current_data)
-        tensor_onehot_decoder_indexes = torch.from_numpy(one_hot_decoder_indexes)
-        tensor_encoded_labels = torch.from_numpy(encoded_labels)
-        dataset = TensorDataset(tensor_scaled_features, tensor_onehot_decoder_indexes, tensor_encoded_labels)
-        dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-        autoencoder_trainer.fit(autoencoder_network, dataloader)
+        wandb.watch(network)
 
         # train network
         np.random.seed(100)
         random.seed(100)
         torch.random.manual_seed(100)
-        # network = LightningNetwork(features.shape[1], encoded_labels.shape[1], 2, 128)
-        network = LightningNetwork(autoencoder_latent_shape + one_hot_decoder_indexes.shape[1], encoded_labels.shape[1], 2, hidden_size)
         wandb.watch(network, log_freq=5)
-        trainer = pl.Trainer(max_epochs=200, callbacks=[EarlyStopping(monitor="val_loss")])
+        trainer = pl.Trainer(max_epochs=200)
 
         train_tensor_scaled_features = torch.from_numpy(current_data[train_index])
-        with torch.no_grad():
-            _, _, train_tensor_scaled_features = autoencoder_network.get_encoded_features(train_tensor_scaled_features)
-        train_tensor_scaled_features = torch.cat([torch.from_numpy(one_hot_decoder_indexes[train_index]), train_tensor_scaled_features], 1)
+        train_tensor_onehot_decoder_indexes = torch.from_numpy(one_hot_decoder_indexes[train_index])
         train_tensor_encoded_labels = torch.from_numpy(encoded_labels[train_index])
         train_dataset = TensorDataset(train_tensor_scaled_features,
+                                      train_tensor_onehot_decoder_indexes,
                                       train_tensor_encoded_labels)
         train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 
         val_tensor_scaled_features = torch.from_numpy(current_data[val_index])
-        with torch.no_grad():
-            _, _, val_tensor_scaled_features = autoencoder_network.get_encoded_features(val_tensor_scaled_features)
-        val_tensor_scaled_features = torch.cat(
-            [torch.from_numpy(one_hot_decoder_indexes[val_index]), val_tensor_scaled_features], 1)
+        val_tensor_onehot_decoder_indexes = torch.from_numpy(one_hot_decoder_indexes[val_index])
         val_tensor_encoded_labels = torch.from_numpy(encoded_labels[val_index])
-        val_dataset = TensorDataset(val_tensor_scaled_features, val_tensor_encoded_labels)
+        val_dataset = TensorDataset(val_tensor_scaled_features, val_tensor_onehot_decoder_indexes,
+                                    val_tensor_encoded_labels)
         val_dataloader = DataLoader(val_dataset, batch_size=16, shuffle=False)
 
         trainer.fit(network, train_dataloader, val_dataloader)
 
-        outputs = network(val_tensor_scaled_features)
+        outputs = network([val_tensor_onehot_decoder_indexes, val_tensor_scaled_features])
         predicted = torch.sigmoid(outputs).detach().numpy()
 
         if y_true_list is None:
