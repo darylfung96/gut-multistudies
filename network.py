@@ -1,9 +1,11 @@
 import torch
 import torch.nn as nn
-import numpy as np
+import torch.nn.functional as F
 
 import pytorch_lightning as pl
 import wandb
+
+from losses import SupConLoss
 
 
 class LightningNetwork(pl.LightningModule):
@@ -13,13 +15,20 @@ class LightningNetwork(pl.LightningModule):
         self.network = Network(input_shape, output_shape, num_layers, hidden_size, conditional_latent_size)
         self.loss = nn.BCELoss()
 
+    def get_last_features(self, inputs):
+        if self.conditional_latent_size != 0:
+            current_inputs, onehot = inputs
+            if type(current_inputs) != torch.Tensor:
+                current_inputs = torch.from_numpy(current_inputs)
+            return self.network.get_last_features([current_inputs, onehot])
+
+        return self.network.get_last_features(inputs)
+
     def forward(self, inputs):
         if self.conditional_latent_size != 0:
             current_inputs, onehot = inputs
-
-        if type(current_inputs) != torch.Tensor:
-            current_inputs = torch.from_numpy(current_inputs)
-        if self.conditional_latent_size != 0:
+            if type(current_inputs) != torch.Tensor:
+                current_inputs = torch.from_numpy(current_inputs)
             return self.network([current_inputs, onehot])
 
         return self.network(inputs)
@@ -46,6 +55,7 @@ class LightningNetwork(pl.LightningModule):
 
     def on_validation_start(self):
         self.eval()
+        self.train(False)
 
     def validation_step(self, val_batch, batch_index):
         if self.conditional_latent_size != 0:
@@ -61,6 +71,218 @@ class LightningNetwork(pl.LightningModule):
         return loss
 
 
+class LightningContrastNetwork(LightningNetwork):
+    def __init__(self, input_shape, output_shape, num_layers, hidden_size):
+        super(LightningContrastNetwork, self).__init__(input_shape, output_shape, num_layers, hidden_size)
+        self.loss = nn.BCELoss()
+
+        first_layer = nn.Linear(input_shape, hidden_size)
+
+        all_layers = [first_layer, nn.ReLU()]
+
+        for i in range(num_layers):
+            all_layers.append(nn.Linear(hidden_size, hidden_size))
+            all_layers.append(nn.ReLU())
+
+        self.layers = nn.Sequential(*all_layers)
+        self.second_last_output_layer = nn.Linear(hidden_size, hidden_size)
+        self.output_layer = nn.Linear(hidden_size, output_shape)
+
+        # loss
+        self.loss = nn.BCELoss()
+        self.contrast_loss = SupConLoss()
+        self.head = nn.Sequential(nn.Linear(hidden_size, 64), nn.ReLU(), nn.Linear(64, 64))
+
+    def get_features(self, inputs):
+        output = self.layers(inputs)
+        return self.second_last_output_layer(output)
+
+    def training_step(self, train_batch, batch_index):
+        x, y = train_batch
+
+        output = self.layers(x)
+        second_output = self.second_last_output_layer(output)
+        contrast_head_output = self.head(second_output)
+        last_output = self.output_layer(second_output)
+
+        predicted = torch.sigmoid(last_output)
+        contrast_loss = self.contrast_loss(F.normalize(contrast_head_output, dim=1).unsqueeze(1), y.argmax(1))
+        loss = self.loss(predicted, y)
+        total_loss = loss + 0.2 * contrast_loss
+
+        self.log("train_loss", loss)
+        wandb.log({"train_loss": loss})
+        return total_loss
+
+    def validation_step(self, val_batch, batch_index):
+        x, y = val_batch
+
+        output = self.layers(x)
+        second_output = self.second_last_output_layer(output)
+        contrast_head_output = F.normalize(self.head(second_output), dim=1)
+        last_output = self.output_layer(second_output)
+
+        predicted = torch.sigmoid(last_output)
+        contrast_loss = self.contrast_loss(contrast_head_output.unsqueeze(1), y.argmax(1))
+        loss = self.loss(predicted, y)
+
+        total_loss = loss + 0.2 * contrast_loss
+
+        self.log("val_loss", loss)
+        wandb.log({"val_loss": loss})
+        return total_loss
+
+
+
+class LightningMultiTaskNetwork(LightningNetwork):
+    def __init__(self, input_shape, output_shape, secondary_output_shape, num_layers, hidden_size, conditional_latent_size=0):
+        super(LightningMultiTaskNetwork, self).__init__(input_shape, output_shape, num_layers, hidden_size,
+                                                        conditional_latent_size)
+        self.second_loss = nn.NLLLoss()
+        self.best_loss = 1e9
+        self.best_weights = None
+        self.num_layers = num_layers
+
+        # network definition #
+        self.first_layer = nn.Sequential(nn.Linear(input_shape, hidden_size), nn.ReLU())
+        self.all_layers = []
+        self.secondary_layers = []
+
+        self.train_secondary_only = True
+
+        for i in range(num_layers):
+            self.all_layers.append(nn.Linear(hidden_size, hidden_size))
+            self.all_layers.append(nn.ReLU())
+
+            self.secondary_layers.append(nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, secondary_output_shape)
+            ))
+            # all_layers.append(nn.Dropout(0.5))
+
+        self.output_layer = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, output_shape)
+        )
+
+        self.optim = torch.optim.Adam(self.parameters())
+
+        # loss
+        self.loss = nn.BCELoss()
+        self.recons_loss = nn.MSELoss()
+
+        self.reconstruction_task_layer = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, input_shape)
+        )
+
+        self.second_task_layer = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, secondary_output_shape)
+        )
+
+    def set_train_secondary_only(self, value):
+        self.train_secondary_only = value
+
+    def get_intermediate_layers(self, inputs):
+        all_outputs = []
+        current_outputs = self.first_layer(inputs)
+        for i in range(self.num_layers):
+            current_output = self.all_layers[i](current_outputs)
+            all_outputs.append(current_output)
+        return all_outputs
+
+    def forward(self, inputs):
+        current_inputs = self.first_layer(inputs)
+        for i in range(self.num_layers):
+            current_inputs = self.all_layers[i](current_inputs)
+        output = self.output_layer(current_inputs)
+
+        second_task_output = self.second_task_layer(current_inputs)
+        reconstruction_output = self.reconstruction_task_layer(current_inputs)
+
+        return output, second_task_output, reconstruction_output
+
+    def set_best_weights(self, best_weights):
+        self.best_weights = best_weights
+
+    def load_best_weights(self):
+        self.load_state_dict(self.best_weights)
+
+    def training_step(self, train_batch, batch_index):
+        x, y, secondary_y = train_batch
+
+        output, second_task_output, reconstruction_output = self(x)
+        predicted = torch.sigmoid(output)
+        secondary_prediction = torch.log_softmax(second_task_output, 1)
+
+        intermediate_outputs = self.get_intermediate_layers(x)
+        intermediate_losses = 0
+        for i in range(self.num_layers):
+            secondary_output = torch.log_softmax(self.secondary_layers[i](intermediate_outputs[i]), 1)
+            intermediate_loss = self.second_loss(secondary_output, secondary_y.argmax(1))
+            intermediate_losses += intermediate_loss
+
+        if not self.train_secondary_only:
+            loss = self.loss(predicted, y)
+        else:
+            loss = 0
+
+        second_loss = self.second_loss(secondary_prediction, secondary_y.argmax(1))
+        recons_loss = self.recons_loss(torch.sigmoid(reconstruction_output), x)
+        # total_loss = loss + 0.25 * second_loss + 0.25 * intermediate_losses
+        total_loss = loss + 0.8 * second_loss + 0.1 * intermediate_losses
+
+        self.log('train_loss', loss, prog_bar=True)
+        self.log('train_secondary_loss', second_loss)
+
+        wandb.log({"train_loss": loss, 'train_secondary_loss': second_loss})
+        return total_loss
+
+    def validation_step(self, val_batch, batch_index):
+        x, y, secondary_y = val_batch
+
+        output, second_task_output, reconstruction_output = self(x)
+        predicted = torch.sigmoid(output)
+        secondary_prediction = torch.log_softmax(second_task_output, 1)
+
+        intermediate_outputs = self.get_intermediate_layers(x)
+        intermediate_losses = 0
+        for i in range(self.num_layers):
+            secondary_output = torch.log_softmax(self.secondary_layers[i](intermediate_outputs[i]), 1)
+            intermediate_loss = self.second_loss(secondary_output, secondary_y.argmax(1))
+            intermediate_losses += intermediate_loss
+
+        if not self.train_secondary_only:
+            loss = self.loss(predicted, y)
+        else:
+            loss = self.second_loss(secondary_prediction, secondary_y.argmax(1))
+
+        second_loss = self.second_loss(secondary_prediction, secondary_y.argmax(1))
+        total_loss = loss + second_loss + intermediate_losses
+        # recons_loss = self.recons_loss(torch.sigmoid(reconstruction_output), x)
+        # total_loss = loss + second_loss + recons_loss
+
+        if loss < self.best_loss:
+            self.best_weights = self.state_dict()
+
+        self.log('val_loss', loss, prog_bar=True)
+        self.log('val_secondary_loss', second_loss)
+
+        wandb.log({"val_loss": loss, 'val_secondary_loss': second_loss})
+        return total_loss
+
+
 class LightningAutoencoderNetwork(LightningNetwork):
 
     def __init__(self, input_shape, output_shape, condition_latent_size, num_layers, hidden_size, network_type='normal'):
@@ -74,12 +296,21 @@ class LightningAutoencoderNetwork(LightningNetwork):
 
         self.network_type = network_type
         self.network = networks_dict[network_type]()
-        self.loss = nn.L1Loss()
+        self.loss = nn.MSELoss()
+        self.second_loss = nn.NLLLoss()
+        self.contrastive_loss = SupConLoss()
+
+        # for contrastive
+        self.head = nn.Sequential(nn.Linear(hidden_size, 64), nn.ReLU(), nn.Linear(64, condition_latent_size))
+        self.encoded_head = nn.Sequential(nn.Linear(hidden_size, 64), nn.ReLU(), nn.Linear(64, 64))
 
     def get_encoded_features(self, inputs):
         if type(inputs) != torch.Tensor:
             inputs = torch.from_numpy(inputs)
         return self.network.get_encoded_features(inputs)
+
+    def decode(self, encoded_features):
+        return self.network.decode(encoded_features)
 
     def forward(self, inputs):
         if type(inputs) != torch.Tensor:
@@ -90,17 +321,25 @@ class LightningAutoencoderNetwork(LightningNetwork):
         x, onehot_decoder_indexes, y = train_batch
 
         if self.network_type == 'conditional':
-            mean, log_var, encoded_output, reconstructed_output = self.network([onehot_decoder_indexes, x])
+            # mean, log_var, encoded_output, reconstructed_output = self.network([onehot_decoder_indexes, x])
+            encoded_output, reconstructed_output = self.network([onehot_decoder_indexes, x])
         else:
-            mean, log_var, encoded_output, reconstructed_output = self.network(x)
+            encoded_output, reconstructed_output = self.network(x)
+            # mean, log_var, encoded_output, reconstructed_output = self.network(x)
 
         reconstruction_loss = self.loss(reconstructed_output, x)
-        kld_loss = - 0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
-        loss = reconstruction_loss + kld_loss
+        # kld_loss = - 0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
+        # for contrastive loss
+        # contrast_loss = self.contrastive_loss(F.normalize(self.head(x), dim=1).unsqueeze(1), onehot_decoder_indexes.argmax(1))
+        # encoded_contrast_loss = self.contrastive_loss(F.normalize(self.encoded_head(encoded_output),
+        #                                                           dim=1).unsqueeze(1), onehot_decoder_indexes.argmax(1))
+        # second_loss = self.second_loss(torch.log_softmax(self.head(encoded_output), 1), onehot_decoder_indexes.argmax(1))
+
+        loss = reconstruction_loss #+ encoded_contrast_loss #+ contrast_loss + encoded_contrast_loss  # + kld_loss
         # output_loss = self.classify_loss(output, y)
 
         self.log('train_autoencoder_loss', loss)
-
+        # self.log('train_contrast_loss', contrast_loss)
         wandb.log({"train_autoencoder_loss": loss})
         return loss
 
@@ -109,11 +348,12 @@ class LightningAutoencoderNetwork(LightningNetwork):
         mean, log_var, encoded_output, reconstructed_output = self.network([onehot_decoder_indexes, x])
 
         reconstruction_loss = self.loss(reconstructed_output, x)
-        kld_loss = - 0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
-        loss = reconstruction_loss + kld_loss
+        # contrast_loss = self.contrastive_loss(F.normalize(self.head(x)).unsqueeze(1), onehot_decoder_indexes.argmax(1))
+        # kld_loss = - 0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
+        loss = reconstruction_loss# + kld_loss
         self.log('val_autoencoder_loss', loss)
-
-        wandb.log({"val_autoencoder_loss": loss})
+        # self.log('train_contrast_loss', contrast_loss)
+        wandb.log({"train_autoencoder_loss": loss})
         return loss
 
 
@@ -383,7 +623,7 @@ class MultiAutoencoderNetwork(nn.Module):
                        nn.Linear(2 * hidden_size, hidden_size), nn.ReLU(), nn.Dropout(0.5),
                        nn.Linear(hidden_size, input_shape)]
             self.decoder = nn.Sequential(*decoder)
-            self.optim = torch.optim.Adam(list(self.decoder.parameters()) + encoders_param)
+            self.optim = torch.optim.Adam(self.parameters())#torch.optim.Adam(list(self.decoder.parameters()) + encoders_param)
         else:
             # multiple decoders
             encoder = [nn.Linear(input_shape, 2 * hidden_size), nn.ReLU(), nn.Dropout(0.5),
@@ -403,7 +643,7 @@ class MultiAutoencoderNetwork(nn.Module):
                     decoders_param = list(decoder.parameters())
                 else:
                     decoders_param += list(decoder.parameters())
-            self.optim = torch.optim.Adam(list(self.encoder.parameters()) + decoders_param)
+            self.optim = torch.optim.Adam(self.parameters())#torch.optim.Adam(list(self.encoder.parameters()) + decoders_param)
 
         # loss
         self.loss = nn.BCELoss()
@@ -448,16 +688,16 @@ class AutoencoderNetwork(nn.Module):
     def __init__(self, input_shape, output_shape, hidden_size):
         super(AutoencoderNetwork, self).__init__()
 
-        encoder = [nn.Linear(input_shape, 2 * hidden_size), nn.ReLU(), nn.Dropout(0.5),
-                   nn.Linear(2 * hidden_size, hidden_size), nn.ReLU(), nn.Dropout(0.5)]
+        encoder = [nn.Linear(input_shape, 2 * hidden_size), nn.ReLU(),
+                   nn.Linear(2 * hidden_size, hidden_size), nn.ReLU()]
         self.encoder = nn.Sequential(*encoder)
-        self.mean_layer = nn.Linear(hidden_size, hidden_size)
-        self.log_var_layer = nn.Linear(hidden_size, hidden_size)
+        # self.mean_layer = nn.Linear(hidden_size, hidden_size)
+        # self.log_var_layer = nn.Linear(hidden_size, hidden_size)
 
-        decoder = [nn.Linear(hidden_size, 2 * hidden_size), nn.ReLU(), nn.Dropout(0.5),
+        decoder = [nn.Linear(hidden_size, 2 * hidden_size), nn.ReLU(),
                    nn.Linear(2 * hidden_size, input_shape)]
         self.decoder = nn.Sequential(*decoder)
-        self.optim = torch.optim.Adam(list(self.encoder.parameters()) + list(self.decoder.parameters()))
+        self.optim = torch.optim.Adam(self.parameters())#torch.optim.Adam(list(self.encoder.parameters()) + list(self.decoder.parameters()))
 
         # loss
         self.loss = nn.BCELoss()
@@ -469,13 +709,19 @@ class AutoencoderNetwork(nn.Module):
 
     def get_encoded_features(self, inputs):
         encoded = self.encoder(inputs)
-        mean, log_var = self.mean_layer(encoded), self.log_var_layer(encoded)
-        return mean, log_var, self.reparameterization(mean, log_var)
+        return encoded
+        # mean, log_var = self.mean_layer(encoded), self.log_var_layer(encoded)
+        # return mean, log_var, self.reparameterization(mean, log_var)
+
+    def decode(self, encoded_features):
+        return self.decoder(encoded_features)
 
     def forward(self, inputs):
-        mean, log_var, encoded_output = self.get_encoded_features(inputs)
-        reconstructed_output = self.decoders(encoded_output)
-        return mean, log_var, encoded_output, reconstructed_output
+        # mean, log_var, encoded_output = self.get_encoded_features(inputs)
+        encoded_output = self.get_encoded_features(inputs)
+        reconstructed_output = self.decoder(encoded_output)
+        return encoded_output, reconstructed_output
+        # return mean, log_var, encoded_output, reconstructed_output
 
 
 class ConditionalNetwork(AutoencoderNetwork):
@@ -483,16 +729,16 @@ class ConditionalNetwork(AutoencoderNetwork):
         super(ConditionalNetwork, self).__init__(input_shape, output_shape, hidden_size)
         self.condition_latent_size = condition_latent_size
 
-        encoder = [nn.Linear(input_shape, 2 * hidden_size), nn.ReLU(), nn.Dropout(0.5),
-                   nn.Linear(2 * hidden_size, hidden_size), nn.ReLU(), nn.Dropout(0.5)]
+        encoder = [nn.Linear(input_shape, 2 * hidden_size), nn.ReLU(),
+                   nn.Linear(2 * hidden_size, hidden_size), nn.ReLU()]
         self.encoder = nn.Sequential(*encoder)
-        self.mean_layer = nn.Linear(hidden_size, hidden_size)
-        self.log_var_layer = nn.Linear(hidden_size, hidden_size)
+        # self.mean_layer = nn.Linear(hidden_size, hidden_size)
+        # self.log_var_layer = nn.Linear(hidden_size, hidden_size)
 
-        decoder = [nn.Linear(hidden_size + condition_latent_size, 2 * hidden_size), nn.ReLU(), nn.Dropout(0.5),
+        decoder = [nn.Linear(hidden_size + condition_latent_size, 2 * hidden_size), nn.ReLU(),
                    nn.Linear(2 * hidden_size, input_shape)]
         self.decoder = nn.Sequential(*decoder)
-        self.optim = torch.optim.Adam(list(self.encoder.parameters()) + list(self.decoder.parameters()))
+        self.optim = torch.optim.Adam(self.parameters())#torch.optim.Adam(list(self.encoder.parameters()) + list(self.decoder.parameters()))
 
         # loss
         self.loss = nn.BCELoss()
@@ -500,12 +746,18 @@ class ConditionalNetwork(AutoencoderNetwork):
     def combine_onehot_and_encoded_feature(self, condition_latents, encoded_outputs):
         return torch.cat([condition_latents, encoded_outputs], 1)
 
+    def decode(self, encoded_features):
+        # expect [ condition, and features ]
+        return self.decoder(encoded_features)
+
     def forward(self, inputs):
         condition_latents, current_inputs = inputs
-        mean, log_var, encoded_output = self.get_encoded_features(current_inputs)
+        # mean, log_var, encoded_output = self.get_encoded_features(current_inputs)
+        encoded_output = self.get_encoded_features(current_inputs)
         encoded_output = self.combine_onehot_and_encoded_feature(condition_latents, encoded_output)
         reconstructed_output = self.decoder(encoded_output)
-        return mean, log_var, encoded_output, reconstructed_output
+        return encoded_output, reconstructed_output
+        # return mean, log_var, encoded_output, reconstructed_output
 
 
 class Network(nn.Module):
@@ -524,7 +776,7 @@ class Network(nn.Module):
         for i in range(num_layers):
             all_layers.append(nn.Linear(hidden_size, hidden_size))
             all_layers.append(nn.ReLU())
-            all_layers.append(nn.Dropout(0.5))
+            # all_layers.append(nn.Dropout(0.5))
 
         self.layers = nn.Sequential(*all_layers)
         if conditional_latent_size != 0:
@@ -534,20 +786,27 @@ class Network(nn.Module):
 
         self.output_layer = nn.Linear(hidden_size, output_shape)
 
-        self.optim = torch.optim.Adam(self.layers.parameters())
-
         # loss
         self.loss = nn.BCELoss()
 
-    def forward(self, inputs):
-        x, onehot = inputs
+    def get_last_features(self, inputs):
         if self.conditional_latent_size != 0:
+            x, onehot = inputs
             output = self.layers(torch.cat([onehot, x], 1))
             output = torch.cat([onehot, output], 1)
         else:
-            output = self.layers(x)
+            output = self.layers(inputs)
+
+        return self.second_last_output_layer(output)
+
+    def forward(self, inputs):
+        if self.conditional_latent_size != 0:
+            x, onehot = inputs
+            output = self.layers(torch.cat([onehot, x], 1))
+            output = torch.cat([onehot, output], 1)
+        else:
+            output = self.layers(inputs)
 
         second_last_output = self.second_last_output_layer(output)
         final_output = self.output_layer(second_last_output)
         return final_output
-

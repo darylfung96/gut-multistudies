@@ -14,11 +14,11 @@ from sklearn import metrics
 import matplotlib.pyplot as plt
 import wandb
 
-from network import LightningNetwork, LightningAutoencoderNetwork
+from network import LightningNetwork, LightningContrastNetwork, LightningAutoencoderNetwork
 
 wandb.login()
 
-current_dataset = 'plaque'  # joined or plaque
+current_dataset = 'joined'  # joined or plaque
 type_data = 'species'  # genus or species
 is_impute = False
 
@@ -52,7 +52,7 @@ for idx, current_data in enumerate(all_data):
     correction_str = 'after correction'
     folds = KFold(5, shuffle=True)
 
-    wandb.init(name=f'wasif_data_conditional_separate', project='wasif_data', group=f'new test conditional vae separate '
+    wandb.init(name=f'wasif_data_separate', project='wasif_data', group=f'new test ae separate '
                                                                                     f'{current_dataset} {type_data} '
                                                                          f'{"impute" if is_impute else ""}'
                                                                          f'num layers: {num_layers} '            
@@ -76,10 +76,33 @@ for idx, current_data in enumerate(all_data):
     dataloader = DataLoader(dataset, batch_size=64, shuffle=True)
     autoencoder_trainer.fit(autoencoder_network, dataloader)
 
+    cf_index = np.where(labels == 'CF')[0]
+    secc_index = np.where(labels == 'SECC')[0]
+    colors = ['black', 'cyan', 'red', 'blue', 'green']
+    pca = PCA(2).fit_transform(tensor_scaled_features.detach().numpy())
+    colormaps = np.array([colors[i] for i in decoder_indexes])
+    plt.title('normal features')
+    plt.scatter(pca[cf_index, 0], pca[cf_index, 1], c=colormaps[cf_index], marker='o', label='CF')
+    plt.scatter(pca[secc_index, 0], pca[secc_index, 1], c=colormaps[secc_index], marker='+', label='SECC')
+    plt.legend()
+    plt.show()
+
     autoencoder_network.eval()
+    encoded_features = autoencoder_network.get_encoded_features(tensor_scaled_features)
+    encoded_features = torch.cat([
+        torch.from_numpy(one_hot_decoder_indexes),
+        encoded_features
+    ], 1)
+    pca = PCA(2).fit_transform(encoded_features.detach().numpy())
+    plt.title('encoded features')
+    plt.scatter(pca[cf_index, 0], pca[cf_index, 1], c=colormaps[cf_index], marker='o', label='CF')
+    plt.scatter(pca[secc_index, 0], pca[secc_index, 1], c=colormaps[secc_index], marker='+', label='SECC')
+    plt.legend()
+    plt.show()
+
     for unique_label in unique_labels:
-        wandb.init(name=f'wasif_data_conditional_separate_{unique_label}', project='wasif_data',
-                   group=f'new test conditional vae separate '
+        wandb.init(name=f'wasif_data_separate_{unique_label}', project='wasif_data',
+                   group=f'new test ae separate '
                          f'{current_dataset} {type_data} '
                          f'{"impute" if is_impute else ""}'
                          f'num layers: {num_layers} '
@@ -104,8 +127,10 @@ for idx, current_data in enumerate(all_data):
         np.random.seed(100)
         random.seed(100)
         torch.random.manual_seed(100)
-        network = LightningNetwork(autoencoder_latent_shape + one_hot_decoder_indexes.shape[1], encoded_labels.shape[1],
-                                   num_layers, hidden_size)
+        # network = LightningNetwork(autoencoder_latent_shape + one_hot_decoder_indexes.shape[1], encoded_labels.shape[1],
+        #                            num_layers, hidden_size)
+        network = LightningContrastNetwork(autoencoder_latent_shape + one_hot_decoder_indexes.shape[1],
+                                           encoded_labels.shape[1], num_layers, hidden_size)
         wandb.watch(network, log_freq=5)
         trainer = pl.Trainer(max_epochs=200, callbacks=[EarlyStopping(monitor="val_loss", patience=3)])
 
@@ -116,7 +141,7 @@ for idx, current_data in enumerate(all_data):
                                                   train_tensor_scaled_features], 1)
         train_dataset = TensorDataset(train_tensor_scaled_features,
                                       train_tensor_encoded_labels)
-        train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+        train_dataloader = DataLoader(train_dataset, batch_size=64, shuffle=True)
 
         with torch.no_grad():
             val_tensor_scaled_features = autoencoder_network.get_encoded_features(val_features)
@@ -124,9 +149,21 @@ for idx, current_data in enumerate(all_data):
         val_tensor_scaled_features = torch.cat(
             [torch.from_numpy(val_one_hot_decoder_indexes), val_tensor_scaled_features], 1)
         val_dataset = TensorDataset(val_tensor_scaled_features, val_tensor_encoded_labels)
-        val_dataloader = DataLoader(val_dataset, batch_size=16, shuffle=False)
+        val_dataloader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 
         trainer.fit(network, train_dataloader, val_dataloader)
+
+        # get pca
+        all_features = autoencoder_network.get_encoded_features(torch.from_numpy(current_data))
+        all_features = torch.cat(
+            [torch.from_numpy(one_hot_decoder_indexes), all_features], 1)
+        network_features = network.get_last_features(all_features)
+        pca = PCA(2).fit_transform(network_features.detach().numpy())
+        plt.title('last features')
+        plt.scatter(pca[cf_index, 0], pca[cf_index, 1], c=colormaps[cf_index], marker='o', label='CF')
+        plt.scatter(pca[secc_index, 0], pca[secc_index, 1], c=colormaps[secc_index], marker='+', label='SECC')
+        plt.legend()
+        plt.show()
 
         network.eval()
         outputs = network(val_tensor_scaled_features)
