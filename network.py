@@ -7,7 +7,6 @@ import wandb
 
 from losses import SupConLoss
 
-
 class LightningNetwork(pl.LightningModule):
     def __init__(self, input_shape, output_shape, num_layers, hidden_size, conditional_latent_size=0):
         super(LightningNetwork, self).__init__()
@@ -71,11 +70,9 @@ class LightningNetwork(pl.LightningModule):
         return loss
 
 
-class LightningContrastNetwork(LightningNetwork):
+class LightningContrastNetwork(pl.LightningModule):
     def __init__(self, input_shape, output_shape, num_layers, hidden_size):
-        super(LightningContrastNetwork, self).__init__(input_shape, output_shape, num_layers, hidden_size)
-        self.loss = nn.BCELoss()
-
+        super(LightningContrastNetwork, self).__init__()
         first_layer = nn.Linear(input_shape, hidden_size)
 
         all_layers = [first_layer, nn.ReLU()]
@@ -93,9 +90,25 @@ class LightningContrastNetwork(LightningNetwork):
         self.contrast_loss = SupConLoss()
         self.head = nn.Sequential(nn.Linear(hidden_size, 64), nn.ReLU(), nn.Linear(64, 64))
 
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters())
+        return optimizer
+
+    def forward(self, inputs):
+        output = self.layers(inputs)
+        second_output = self.second_last_output_layer(output)
+        last_output = self.output_layer(second_output)
+        return last_output
+
+    def on_train_start(self):
+        self.train()
+
+    def get_last_features(self, inputs):
+        return self.get_features(inputs)
+
     def get_features(self, inputs):
         output = self.layers(inputs)
-        return self.second_last_output_layer(output)
+        return F.relu(self.second_last_output_layer(output))
 
     def training_step(self, train_batch, batch_index):
         x, y = train_batch
@@ -108,11 +121,15 @@ class LightningContrastNetwork(LightningNetwork):
         predicted = torch.sigmoid(last_output)
         contrast_loss = self.contrast_loss(F.normalize(contrast_head_output, dim=1).unsqueeze(1), y.argmax(1))
         loss = self.loss(predicted, y)
-        total_loss = loss + 0.2 * contrast_loss
+        total_loss = loss + 0.01 * contrast_loss
 
         self.log("train_loss", loss)
         wandb.log({"train_loss": loss})
         return total_loss
+
+    def on_validation_start(self):
+        self.eval()
+        self.train(False)
 
     def validation_step(self, val_batch, batch_index):
         x, y = val_batch
@@ -126,7 +143,7 @@ class LightningContrastNetwork(LightningNetwork):
         contrast_loss = self.contrast_loss(contrast_head_output.unsqueeze(1), y.argmax(1))
         loss = self.loss(predicted, y)
 
-        total_loss = loss + 0.2 * contrast_loss
+        total_loss = loss + 0.01 * contrast_loss
 
         self.log("val_loss", loss)
         wandb.log({"val_loss": loss})
