@@ -4,6 +4,8 @@ import torch.nn.functional as F
 
 import pytorch_lightning as pl
 import wandb
+from robust_loss_pytorch import AdaptiveLossFunction
+from ranger21 import Ranger21
 
 from losses import SupConLoss
 
@@ -13,6 +15,11 @@ class LightningNetwork(pl.LightningModule):
         self.conditional_latent_size = conditional_latent_size
         self.network = Network(input_shape, output_shape, num_layers, hidden_size, conditional_latent_size)
         self.loss = nn.BCELoss()
+        # AdaptiveLossFunction()
+
+        self.best_average_val_loss = 1e-9
+        self.val_losses = []
+        self.best_weights = None
 
     def get_last_features(self, inputs):
         if self.conditional_latent_size != 0:
@@ -32,8 +39,12 @@ class LightningNetwork(pl.LightningModule):
 
         return self.network(inputs)
 
+    def load_best_weights(self):
+        self.load_state_dict(self.best_weights)
+
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters())
+        optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
+        # optimizer = Ranger21(self.parameters(), lr=0.001, num_epochs=200, num_batches_per_epoch=5)
         return optimizer
 
     def on_train_start(self):
@@ -66,8 +77,18 @@ class LightningNetwork(pl.LightningModule):
         loss = self.loss(predicted, y)
         self.log('val_loss', loss, prog_bar=True)
 
+        self.val_losses.append(loss)
+
         wandb.log({"val_loss": loss})
         return loss
+
+    def on_validation_end(self) -> None:
+        average_val_loss = sum(self.val_losses) / len(self.val_losses)
+        if self.best_average_val_loss < average_val_loss:
+            self.best_average_val_loss = average_val_loss
+            self.best_weights = self.state_dict()
+
+        self.val_losses = []
 
 
 class LightningContrastNetwork(pl.LightningModule):
@@ -784,16 +805,16 @@ class Network(nn.Module):
         self.conditional_latent_size = conditional_latent_size
 
         if conditional_latent_size != 0:
-            first_layer = nn.Linear(input_shape + conditional_latent_size, hidden_size)
+            self.first_layer = nn.Linear(input_shape + conditional_latent_size, hidden_size)
         else:
-            first_layer = nn.Linear(input_shape, hidden_size)
+            self.first_layer = nn.Linear(input_shape, input_shape*2)
 
-        all_layers = [first_layer, nn.ReLU()]
+        all_layers = [nn.Linear(input_shape, hidden_size), nn.ReLU()]
 
-        for i in range(num_layers):
+        for i in range(num_layers-1):
             all_layers.append(nn.Linear(hidden_size, hidden_size))
             all_layers.append(nn.ReLU())
-            # all_layers.append(nn.Dropout(0.5))
+            all_layers.append(nn.Dropout(0.5))
 
         self.layers = nn.Sequential(*all_layers)
         if conditional_latent_size != 0:
@@ -814,16 +835,18 @@ class Network(nn.Module):
         else:
             output = self.layers(inputs)
 
-        return self.second_last_output_layer(output)
+        return F.relu(self.second_last_output_layer(output))
 
     def forward(self, inputs):
         if self.conditional_latent_size != 0:
             x, onehot = inputs
-            output = self.layers(torch.cat([onehot, x], 1))
+            output = F.relu(self.first_layer(torch.cat([onehot, x], 1)))
+            output = self.layers(output)
             output = torch.cat([onehot, output], 1)
         else:
-            output = self.layers(inputs)
+            output = F.glu(self.first_layer(inputs))
+            output = self.layers(output)
 
-        second_last_output = self.second_last_output_layer(output)
+        second_last_output = F.relu(self.second_last_output_layer(output))
         final_output = self.output_layer(second_last_output)
         return final_output

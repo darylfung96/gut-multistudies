@@ -41,9 +41,9 @@ elif current_dataset == 'plaque':
 else:
     raise Exception('Use either "joined" or "plaque" for current_dataset.')
 
-autoencoder_latent_shape = 20
-hidden_size = 128
-num_layers = 3
+autoencoder_latent_shape = 64
+hidden_size = 32
+num_layers = 2
 features = data.values[:, 3:].astype(np.float32)
 
 labels = data.values[:, 1:2]
@@ -62,7 +62,7 @@ for idx, current_data in enumerate(all_data):
     correction_str = 'after correction'
     folds = KFold(5, shuffle=True)
 
-    wandb.init(name=f'wasif_data_{batch_corrected_text}_separate', project='wasif_data', group=f'new test ae separate '
+    wandb.init(name=f'wasif_data_{batch_corrected_text}_separate', project='wasif_data', group=f'new test ae {batch_corrected_text} separate '
                                                                                     f'{current_dataset} {type_data} '
                                                                          f'{"impute" if is_impute else ""}'
                                                                          f'num layers: {num_layers} '            
@@ -152,7 +152,7 @@ for idx, current_data in enumerate(all_data):
         # network = LightningContrastNetwork(autoencoder_latent_shape + one_hot_decoder_indexes.shape[1],
         #                                    encoded_labels.shape[1], num_layers, hidden_size)
         wandb.watch(network, log_freq=5)
-        trainer = pl.Trainer(max_epochs=200, callbacks=[EarlyStopping(monitor="val_loss", patience=3)])
+        trainer = pl.Trainer(max_epochs=200, callbacks=[EarlyStopping(monitor="val_loss", patience=8)])
 
         with torch.no_grad():
             train_tensor_scaled_features = autoencoder_network.get_encoded_features(scaled_train_features)
@@ -173,6 +173,8 @@ for idx, current_data in enumerate(all_data):
 
         trainer.fit(network, train_dataloader, val_dataloader)
 
+        network.eval()
+        network.load_best_weights()
         # get pca
         all_features = autoencoder_network.get_encoded_features(torch.from_numpy(current_data))
         # all_features = torch.cat(
@@ -186,10 +188,8 @@ for idx, current_data in enumerate(all_data):
         wandb.log({f'Last Features {unique_label}': wandb.Image(plt)})
         plt.clf()
 
-        network.eval()
         outputs = network(val_tensor_scaled_features)
         predicted = torch.sigmoid(outputs).detach().numpy()
-
 
         # plot roc curve
         fpr, tpr, _ = metrics.roc_curve(val_labels.ravel(), predicted.ravel())
