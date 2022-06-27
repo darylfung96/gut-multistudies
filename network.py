@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,7 +8,9 @@ import wandb
 from robust_loss_pytorch import AdaptiveLossFunction
 from ranger21 import Ranger21
 
+from vqvae import VectorQuantizer
 from losses import SupConLoss
+
 
 class LightningNetwork(pl.LightningModule):
     def __init__(self, input_shape, output_shape, num_layers, hidden_size, conditional_latent_size=0):
@@ -321,15 +324,16 @@ class LightningMultiTaskNetwork(LightningNetwork):
         return total_loss
 
 
-class LightningAutoencoderNetwork(LightningNetwork):
+class LightningAutoencoderNetwork(pl.LightningModule):
 
     def __init__(self, input_shape, output_shape, condition_latent_size, num_layers, hidden_size, network_type='normal'):
         # network_type can be 'normal' or 'conditional'
-        super(LightningAutoencoderNetwork, self).__init__(input_shape, output_shape, num_layers, hidden_size)
+        super(LightningAutoencoderNetwork, self).__init__()
 
         networks_dict = {
-            'conditional': lambda: ConditionalNetwork(input_shape, condition_latent_size, output_shape, hidden_size),
-            'normal': lambda: AutoencoderNetwork(input_shape, output_shape, hidden_size)
+            'conditional': lambda: ConditionalNetwork(input_shape, condition_latent_size, output_shape, hidden_size, network_type),
+            'normal': lambda: AutoencoderNetwork(input_shape, output_shape, hidden_size, network_type),
+            'vqvae': lambda: ConditionalNetwork(input_shape, condition_latent_size, output_shape, hidden_size, network_type)
         }
 
         self.network_type = network_type
@@ -353,19 +357,43 @@ class LightningAutoencoderNetwork(LightningNetwork):
     def forward(self, inputs):
         if type(inputs) != torch.Tensor:
             inputs = torch.from_numpy(inputs)
-        return self.network(inputs)
+        if self.type == 'vqvae':
+            loss, encoded_features, persplexity, _ = self.network(inputs)
+            return encoded_features
+        else:
+            encoded_features = self.network(inputs)
+            return encoded_features
+
+    def load_best_weights(self):
+        self.load_state_dict(self.best_weights)
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
+        # optimizer = Ranger21(self.parameters(), lr=0.001, num_epochs=200, num_batches_per_epoch=5)
+        return optimizer
+
+    def on_train_start(self) -> None:
+        self.train(True)
 
     def training_step(self, train_batch, batch_index):
         x, onehot_decoder_indexes, y = train_batch
 
-        if self.network_type == 'conditional':
+        total_loss = 0
+        if self.network_type == 'conditional' or self.network_type == 'vqvae':
             # mean, log_var, encoded_output, reconstructed_output = self.network([onehot_decoder_indexes, x])
             encoded_output, reconstructed_output = self.network([onehot_decoder_indexes, x])
+            if self.type == 'vqvae':
+                loss, encode_features, persplexity, _ = encoded_output
+                total_loss = total_loss + loss
         else:
             encoded_output, reconstructed_output = self.network(x)
+            if self.type == 'vqvae':
+                loss, encode_features, persplexity, _ = encoded_output
+                total_loss = total_loss + loss
             # mean, log_var, encoded_output, reconstructed_output = self.network(x)
 
         reconstruction_loss = self.loss(reconstructed_output, x)
+        total_loss = total_loss + reconstruction_loss
         # kld_loss = - 0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
         # for contrastive loss
         # contrast_loss = self.contrastive_loss(F.normalize(self.head(x), dim=1).unsqueeze(1), onehot_decoder_indexes.argmax(1))
@@ -373,13 +401,17 @@ class LightningAutoencoderNetwork(LightningNetwork):
         #                                                           dim=1).unsqueeze(1), onehot_decoder_indexes.argmax(1))
         # second_loss = self.second_loss(torch.log_softmax(self.head(encoded_output), 1), onehot_decoder_indexes.argmax(1))
 
-        loss = reconstruction_loss #+ encoded_contrast_loss #+ contrast_loss + encoded_contrast_loss  # + kld_loss
+        # loss = reconstruction_loss #+ encoded_contrast_loss #+ contrast_loss + encoded_contrast_loss  # + kld_loss
         # output_loss = self.classify_loss(output, y)
 
-        self.log('train_autoencoder_loss', loss)
+        self.log('train_autoencoder_loss', total_loss)
         # self.log('train_contrast_loss', contrast_loss)
-        wandb.log({"train_autoencoder_loss": loss})
-        return loss
+        wandb.log({"train_autoencoder_loss": total_loss})
+        return total_loss
+
+    def on_validation_start(self):
+        self.eval()
+        self.train(False)
 
     def validation_step(self, val_batch, batch_index):
         x, onehot_decoder_indexes, y = val_batch
@@ -393,6 +425,151 @@ class LightningAutoencoderNetwork(LightningNetwork):
         # self.log('train_contrast_loss', contrast_loss)
         wandb.log({"train_autoencoder_loss": loss})
         return loss
+
+
+class LightningAutoencoderCombineNetwork(pl.LightningModule):
+
+    def __init__(self, input_shape, output_shape, condition_latent_size, num_layers, latent_size, hidden_size, network_type='normal'):
+        # network_type can be 'normal' or 'conditional'
+        super(LightningAutoencoderCombineNetwork, self).__init__()
+
+        networks_dict = {
+            'conditional': lambda: ConditionalNetwork(input_shape, condition_latent_size, output_shape, latent_size, network_type),
+            'normal': lambda: AutoencoderNetwork(input_shape, output_shape, latent_size, network_type),
+            'vqvae': lambda: ConditionalNetwork(input_shape, condition_latent_size, output_shape, latent_size, network_type)
+        }
+
+        self.latent_size = latent_size
+        self.condition_latent_size = condition_latent_size
+        self.network_type = network_type
+        self.autoencoder_network = networks_dict[network_type]()
+        self.loss = nn.MSELoss()
+        self.second_loss = nn.NLLLoss()
+        self.contrastive_loss = SupConLoss()
+        self.autoencoder_dataset = None
+
+        # for classification
+        self.network = Network(condition_latent_size + latent_size, output_shape, num_layers, hidden_size)
+        self.binary_loss = nn.BCELoss()
+
+        # for contrastive
+        self.head = nn.Sequential(nn.Linear(latent_size, 64), nn.ReLU(), nn.Linear(64, condition_latent_size))
+        self.encoded_head = nn.Sequential(nn.Linear(latent_size, 64), nn.ReLU(), nn.Linear(64, 64))
+
+        # best weights
+        self.best_average_val_loss = 1e-9
+        self.val_losses = []
+        self.best_weights = None
+
+    def __exp_decay(self):
+        if self.current_epoch > 100:
+            return 0
+        initial_lrate = 1
+        k = 0.1
+        lrate = initial_lrate * np.exp(-k * self.current_epoch)
+        return lrate
+
+    def get_encoded_features(self, inputs):
+        if type(inputs) != torch.Tensor:
+            inputs = torch.from_numpy(inputs)
+        return self.autoencoder_network.get_encoded_features(inputs)
+
+    def set_autoencoder_dataset(self, dataset):
+        self.autoencoder_dataset = dataset
+
+    def decode(self, encoded_features):
+        return self.autoencoder_network.decode(encoded_features)
+
+    def forward(self, inputs):
+        if self.type == 'vqvae':
+            loss, encoded_features, persplexity, _ = self.autoencoder_network(inputs)
+            return encoded_features
+        else:
+            encoded_features, reconstruction_output = self.autoencoder_network(inputs)
+            outputs = self.network(encoded_features)
+            return outputs
+
+    def load_best_weights(self):
+        self.load_state_dict(self.best_weights)
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
+        # optimizer = Ranger21(self.parameters(), lr=0.001, num_epochs=200, num_batches_per_epoch=5)
+        return optimizer
+
+    def on_train_start(self) -> None:
+        self.train(True)
+
+    def training_step(self, train_batch, batch_index):
+        x, onehot_decoder_indexes, y = train_batch
+
+        total_loss = 0
+        if self.network_type == 'conditional' or self.network_type == 'vqvae':
+            # mean, log_var, encoded_output, reconstructed_output = self.network([onehot_decoder_indexes, x])
+            autoencoder_x, autoencoder_onehot_decoder_indexes, autoencoder_y = next(self.autoencoder_dataset)
+            _, reconstructed_output = self.autoencoder_network([autoencoder_onehot_decoder_indexes, autoencoder_x])
+            encoded_output, _ = self.autoencoder_network([onehot_decoder_indexes, x])
+            outputs = torch.sigmoid(self.network(encoded_output))
+
+            classification_loss = (1-self.__exp_decay()) * self.binary_loss(outputs, y)
+            total_loss = total_loss + classification_loss
+
+            if self.type == 'vqvae':
+                loss, encode_features, persplexity, _ = encoded_output
+                total_loss = total_loss + loss
+        else:
+            autoencoder_x, autoencoder_onehot_decoder_indexes, autoencoder_y = next(self.autoencoder_dataset)
+            _, reconstructed_output = self.autoencoder_network([autoencoder_onehot_decoder_indexes, autoencoder_x])
+            encoded_output, reconstructed_output = self.autoencoder_network(x)
+            if self.type == 'vqvae':
+                loss, encode_features, persplexity, _ = encoded_output
+                total_loss = total_loss + loss
+            # mean, log_var, encoded_output, reconstructed_output = self.autoencoder_network(x)
+
+        reconstruction_loss = self.loss(reconstructed_output, autoencoder_x)
+        total_loss = total_loss + self.__exp_decay() * reconstruction_loss
+        # kld_loss = - 0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
+        # for contrastive loss
+        # contrast_loss = self.contrastive_loss(F.normalize(self.head(x), dim=1).unsqueeze(1), onehot_decoder_indexes.argmax(1))
+        # encoded_contrast_loss = self.contrastive_loss(F.normalize(self.encoded_head(encoded_output),
+        #                                                           dim=1).unsqueeze(1), onehot_decoder_indexes.argmax(1))
+        # second_loss = self.second_loss(torch.log_softmax(self.head(encoded_output), 1), onehot_decoder_indexes.argmax(1))
+
+        # loss = reconstruction_loss #+ encoded_contrast_loss #+ contrast_loss + encoded_contrast_loss  # + kld_loss
+        # output_loss = self.classify_loss(output, y)
+
+        self.log('train_loss', total_loss)
+        # self.log('train_contrast_loss', contrast_loss)
+        wandb.log({"train_loss": total_loss})
+        return total_loss
+
+    def on_validation_start(self):
+        self.eval()
+        self.train(False)
+
+    def validation_step(self, val_batch, batch_index):
+        x, onehot_decoder_indexes, y = val_batch
+        encoded_output, _ = self.autoencoder_network([onehot_decoder_indexes, x])
+        outputs = torch.sigmoid(self.network(encoded_output))
+
+        classification_loss = self.binary_loss(outputs, y)
+        # contrast_loss = self.contrastive_loss(F.normalize(self.head(x)).unsqueeze(1), onehot_decoder_indexes.argmax(1))
+        # kld_loss = - 0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
+        loss = classification_loss # + kld_loss
+        self.val_losses.append(loss)
+
+        self.log('val_loss', loss)
+        # self.log('train_contrast_loss', contrast_loss)
+        wandb.log({"val_loss": loss})
+        return loss
+
+    def on_validation_end(self) -> None:
+        average_val_loss = sum(self.val_losses) / len(self.val_losses)
+        if self.best_average_val_loss < average_val_loss:
+            self.best_average_val_loss = average_val_loss
+            self.best_weights = self.state_dict()
+
+        self.val_losses = []
 
 
 class LightningJointAutoencoderNetwork(LightningNetwork):
@@ -723,11 +900,16 @@ class MultiAutoencoderNetwork(nn.Module):
 
 
 class AutoencoderNetwork(nn.Module):
-    def __init__(self, input_shape, output_shape, hidden_size):
+    def __init__(self, input_shape, output_shape, hidden_size, network_type='normal'):
         super(AutoencoderNetwork, self).__init__()
+
+        self.network_type = network_type
 
         encoder = [nn.Linear(input_shape, 2 * hidden_size), nn.ReLU(),
                    nn.Linear(2 * hidden_size, hidden_size), nn.ReLU()]
+
+        if self.network_type == 'vqvae':
+            encoder.append(VectorQuantizer(64, hidden_size, 0.25))
         self.encoder = nn.Sequential(*encoder)
         # self.mean_layer = nn.Linear(hidden_size, hidden_size)
         # self.log_var_layer = nn.Linear(hidden_size, hidden_size)
@@ -746,8 +928,12 @@ class AutoencoderNetwork(nn.Module):
         return z
 
     def get_encoded_features(self, inputs):
-        encoded = self.encoder(inputs)
-        return encoded
+        if self.network_type == 'vqvae':
+            loss, encoded, persplexity, _ = self.encoder(inputs)
+            return loss, encoded, persplexity
+        else:
+            encoded = self.encoder(inputs)
+            return encoded
         # mean, log_var = self.mean_layer(encoded), self.log_var_layer(encoded)
         # return mean, log_var, self.reparameterization(mean, log_var)
 
@@ -757,18 +943,27 @@ class AutoencoderNetwork(nn.Module):
     def forward(self, inputs):
         # mean, log_var, encoded_output = self.get_encoded_features(inputs)
         encoded_output = self.get_encoded_features(inputs)
-        reconstructed_output = self.decoder(encoded_output)
+        if self.type == 'vqvae':
+            _, encoded_features, _ = encoded_output
+            reconstructed_output = self.decoder(encoded_features)
+        else:
+            reconstructed_output = self.decoder(encoded_output)
+
         return encoded_output, reconstructed_output
         # return mean, log_var, encoded_output, reconstructed_output
 
 
 class ConditionalNetwork(AutoencoderNetwork):
-    def __init__(self, input_shape, condition_latent_size, output_shape, hidden_size):
+    def __init__(self, input_shape, condition_latent_size, output_shape, hidden_size, network_type):
+        # network_type [conditional, vqvae]
         super(ConditionalNetwork, self).__init__(input_shape, output_shape, hidden_size)
         self.condition_latent_size = condition_latent_size
+        self.network_type = network_type
 
         encoder = [nn.Linear(input_shape, 2 * hidden_size), nn.ReLU(),
                    nn.Linear(2 * hidden_size, hidden_size), nn.ReLU()]
+        if self.network_type == 'vqvae':
+            encoder.append(VectorQuantizer(64, hidden_size, 0.25))
         self.encoder = nn.Sequential(*encoder)
         # self.mean_layer = nn.Linear(hidden_size, hidden_size)
         # self.log_var_layer = nn.Linear(hidden_size, hidden_size)
@@ -792,8 +987,13 @@ class ConditionalNetwork(AutoencoderNetwork):
         condition_latents, current_inputs = inputs
         # mean, log_var, encoded_output = self.get_encoded_features(current_inputs)
         encoded_output = self.get_encoded_features(current_inputs)
-        encoded_output = self.combine_onehot_and_encoded_feature(condition_latents, encoded_output)
-        reconstructed_output = self.decoder(encoded_output)
+        if self.network_type == 'vqvae':
+            loss, encoded_features, persplexity = encoded_output
+            encoded_features = self.combine_onehot_and_encoded_feature(condition_latents, encoded_features)
+            reconstructed_output = self.decoder(encoded_features)
+        else:
+            encoded_output = self.combine_onehot_and_encoded_feature(condition_latents, encoded_output)
+            reconstructed_output = self.decoder(encoded_output)
         return encoded_output, reconstructed_output
         # return mean, log_var, encoded_output, reconstructed_output
 
@@ -803,6 +1003,7 @@ class Network(nn.Module):
     def __init__(self, input_shape, output_shape, num_layers, hidden_size, conditional_latent_size=0):
         super(Network, self).__init__()
         self.conditional_latent_size = conditional_latent_size
+        self.attention_layer = nn.MultiheadAttention(hidden_size, 8)
 
         if conditional_latent_size != 0:
             self.first_layer = nn.Linear(input_shape + conditional_latent_size, hidden_size)
@@ -814,7 +1015,7 @@ class Network(nn.Module):
         for i in range(num_layers-1):
             all_layers.append(nn.Linear(hidden_size, hidden_size))
             all_layers.append(nn.ReLU())
-            all_layers.append(nn.Dropout(0.5))
+            # all_layers.append(nn.Dropout(0.5))
 
         self.layers = nn.Sequential(*all_layers)
         if conditional_latent_size != 0:
@@ -846,6 +1047,7 @@ class Network(nn.Module):
         else:
             output = F.glu(self.first_layer(inputs))
             output = self.layers(output)
+            output = self.attention_layer(output.unsqueeze(0), output.unsqueeze(0), output.unsqueeze(0))[0][0]
 
         second_last_output = F.relu(self.second_last_output_layer(output))
         final_output = self.output_layer(second_last_output)
