@@ -461,12 +461,23 @@ class LightningAutoencoderCombineNetwork(pl.LightningModule):
         self.val_losses = []
         self.best_weights = None
 
-    def __exp_decay(self):
+        # generate scheduler for autoencoder and classification weights
+        all_epochs = np.arange(1, 100)
+        self.autoencoder_alpha = list(reversed([self.__exp_decay(epoch) for epoch in all_epochs]))
+        self.autoencoder_alpha = [1 - item for item in self.autoencoder_alpha]
+
+    def __get_autoencoder_alpha(self):
         if self.current_epoch > 100:
+            return 0
+
+        return self.autoencoder_alpha[self.current_epoch]
+
+    def __exp_decay(self, epoch):
+        if epoch > 100:
             return 0
         initial_lrate = 1
         k = 0.1
-        lrate = initial_lrate * np.exp(-k * self.current_epoch)
+        lrate = initial_lrate * np.exp(-k * epoch)
         return lrate
 
     def get_encoded_features(self, inputs):
@@ -511,7 +522,7 @@ class LightningAutoencoderCombineNetwork(pl.LightningModule):
             encoded_output, _ = self.autoencoder_network([onehot_decoder_indexes, x])
             outputs = torch.sigmoid(self.network(encoded_output))
 
-            classification_loss = (1-self.__exp_decay()) * self.binary_loss(outputs, y)
+            classification_loss = (1-self.__get_autoencoder_alpha()) * self.binary_loss(outputs, y)
             total_loss = total_loss + classification_loss
 
             if self.type == 'vqvae':
@@ -527,7 +538,7 @@ class LightningAutoencoderCombineNetwork(pl.LightningModule):
             # mean, log_var, encoded_output, reconstructed_output = self.autoencoder_network(x)
 
         reconstruction_loss = self.loss(reconstructed_output, autoencoder_x)
-        total_loss = total_loss + self.__exp_decay() * reconstruction_loss
+        total_loss = total_loss + self.__get_autoencoder_alpha() * reconstruction_loss
         # kld_loss = - 0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
         # for contrastive loss
         # contrast_loss = self.contrastive_loss(F.normalize(self.head(x), dim=1).unsqueeze(1), onehot_decoder_indexes.argmax(1))
