@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import robust_loss_pytorch
 
 import pytorch_lightning as pl
 import wandb
@@ -436,7 +437,8 @@ class LightningAutoencoderCombineNetwork(pl.LightningModule):
         networks_dict = {
             'conditional': lambda: ConditionalNetwork(input_shape, condition_latent_size, output_shape, latent_size, network_type),
             'normal': lambda: AutoencoderNetwork(input_shape, output_shape, latent_size, network_type),
-            'vqvae': lambda: ConditionalNetwork(input_shape, condition_latent_size, output_shape, latent_size, network_type)
+            'vqvae': lambda: ConditionalNetwork(input_shape, condition_latent_size, output_shape, latent_size, network_type),
+            'vae': lambda: VariationalAutoencoderNetwork(input_shape, output_shape, latent_size, network_type)
         }
 
         self.latent_size = latent_size
@@ -463,17 +465,17 @@ class LightningAutoencoderCombineNetwork(pl.LightningModule):
 
         # generate scheduler for autoencoder and classification weights
         all_epochs = np.arange(1, 100)
-        self.autoencoder_alpha = list(reversed([self.__exp_decay(epoch) for epoch in all_epochs]))
+        self.autoencoder_alpha = list(reversed([self._exp_decay(epoch) for epoch in all_epochs]))
         self.autoencoder_alpha = [1 - item for item in self.autoencoder_alpha]
 
-    def __get_autoencoder_alpha(self):
-        if self.current_epoch > 100:
+    def _get_autoencoder_alpha(self):
+        if self.current_epoch >= 99:
             return 0
 
         return self.autoencoder_alpha[self.current_epoch]
 
-    def __exp_decay(self, epoch):
-        if epoch > 100:
+    def _exp_decay(self, epoch):
+        if epoch >= 100:
             return 0
         initial_lrate = 1
         k = 0.1
@@ -522,7 +524,7 @@ class LightningAutoencoderCombineNetwork(pl.LightningModule):
             encoded_output, _ = self.autoencoder_network([onehot_decoder_indexes, x])
             outputs = torch.sigmoid(self.network(encoded_output))
 
-            classification_loss = (1-self.__get_autoencoder_alpha()) * self.binary_loss(outputs, y)
+            classification_loss = (1-self._get_autoencoder_alpha()) * self.binary_loss(outputs, y)
             total_loss = total_loss + classification_loss
 
             if self.type == 'vqvae':
@@ -538,7 +540,7 @@ class LightningAutoencoderCombineNetwork(pl.LightningModule):
             # mean, log_var, encoded_output, reconstructed_output = self.autoencoder_network(x)
 
         reconstruction_loss = self.loss(reconstructed_output, autoencoder_x)
-        total_loss = total_loss + self.__get_autoencoder_alpha() * reconstruction_loss
+        total_loss = total_loss + self._get_autoencoder_alpha() * reconstruction_loss
         # kld_loss = - 0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
         # for contrastive loss
         # contrast_loss = self.contrastive_loss(F.normalize(self.head(x), dim=1).unsqueeze(1), onehot_decoder_indexes.argmax(1))
@@ -581,6 +583,157 @@ class LightningAutoencoderCombineNetwork(pl.LightningModule):
             self.best_weights = self.state_dict()
 
         self.val_losses = []
+
+
+class LightningAutoencoderCombineBENetwork(LightningAutoencoderCombineNetwork):
+
+    def __init__(self, input_shape, output_shape, condition_latent_size, num_layers, latent_size, hidden_size,
+                 network_type='normal'):
+
+        super(LightningAutoencoderCombineBENetwork, self).__init__(input_shape, output_shape,
+                                                                   condition_latent_size, num_layers,
+                                                                   latent_size, hidden_size, network_type)
+
+        self.network = Network(latent_size, output_shape, num_layers, hidden_size)
+        self.batch_network = nn.Sequential(
+            nn.Linear(latent_size, latent_size * 2),
+            nn.ReLU(),
+            nn.Linear(latent_size * 2, latent_size * 2),
+            nn.ReLU(),
+            nn.Linear(latent_size * 2, condition_latent_size)
+        )
+        self.robust_loss = robust_loss_pytorch.adaptive.AdaptiveLossFunction(num_dims=2, float_dtype=np.float32,
+                                                                             device='cpu')
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(list(self.parameters()) + list(self.robust_loss.parameters()), lr=0.001)
+        return optimizer
+
+    def training_step(self, train_batch, batch_index):
+        x, onehot_decoder_indexes, y = train_batch
+
+        total_loss = 0
+        # reconstruction
+        autoencoder_x, autoencoder_onehot_decoder_indexes, autoencoder_y = next(self.autoencoder_dataset)
+        _, reconstructed_output = self.autoencoder_network(autoencoder_x)
+        reconstruction_loss = self.loss(reconstructed_output, autoencoder_x)
+        total_loss = total_loss + self._get_autoencoder_alpha() * reconstruction_loss
+
+        # classification
+        encoded_output, _ = self.autoencoder_network(x)
+        outputs = torch.sigmoid(self.network(encoded_output))
+        classification_loss = (1 - self._get_autoencoder_alpha()) * torch.mean(self.robust_loss.lossfun(outputs-y))
+
+        # batch effect correction
+        onehot_output = torch.log_softmax(self.batch_network(encoded_output), 1)
+        batch_loss = torch.clamp(-self.second_loss(onehot_output, onehot_decoder_indexes.argmax(1)), -1)
+
+        total_loss = total_loss + classification_loss + 0.01 * batch_loss
+
+        if self.type == 'vqvae':
+            loss, encode_features, persplexity, _ = encoded_output
+            total_loss = total_loss + loss
+
+        self.log('train_loss', total_loss)
+        self.log('train_reconstruction_loss', reconstruction_loss)
+        self.log('train_classification_loss', classification_loss)
+        wandb.log({"train_loss": total_loss,
+                   'train_reconstruction_loss': reconstruction_loss,
+                   'train_classification_loss': classification_loss,
+                   'alpha': self.robust_loss.alpha()[0,0].data,
+                   'scale': self.robust_loss.scale()[0,0].data})
+        return total_loss
+
+    def validation_step(self, val_batch, batch_index):
+        x, onehot_decoder_indexes, y = val_batch
+        encoded_output, _ = self.autoencoder_network(x)
+        outputs = torch.sigmoid(self.network(encoded_output))
+
+        classification_loss = self.binary_loss(outputs, y)
+        loss = classification_loss # + kld_loss
+        self.val_losses.append(loss)
+
+        self.log('val_loss', loss)
+        # self.log('train_contrast_loss', contrast_loss)
+        wandb.log({"val_loss": loss})
+        return loss
+
+
+class LightningVAutoencoderCombineBENetwork(LightningAutoencoderCombineNetwork):
+
+    def __init__(self, input_shape, output_shape, condition_latent_size, num_layers, latent_size, hidden_size,
+                 network_type='vae'):
+
+        super(LightningVAutoencoderCombineBENetwork, self).__init__(input_shape, output_shape,
+                                                                   condition_latent_size, num_layers,
+                                                                   latent_size, hidden_size, network_type)
+
+        self.network = Network(latent_size, output_shape, num_layers, hidden_size)
+        self.batch_network = nn.Sequential(
+            nn.Linear(latent_size, latent_size * 2),
+            nn.ReLU(),
+            nn.Linear(latent_size * 2, latent_size * 2),
+            nn.ReLU(),
+            nn.Linear(latent_size * 2, condition_latent_size)
+        )
+
+        self.loss = nn.L1Loss()
+        self.robust_loss = robust_loss_pytorch.adaptive.AdaptiveLossFunction(num_dims=2, float_dtype=np.float32,
+                                                                             device='cpu')
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(list(self.parameters()) + list(self.robust_loss.parameters()), lr=0.001)
+        return optimizer
+
+    def training_step(self, train_batch, batch_index):
+        x, onehot_decoder_indexes, y = train_batch
+
+        total_loss = 0
+        # reconstruction
+        autoencoder_x, autoencoder_onehot_decoder_indexes, autoencoder_y = next(self.autoencoder_dataset)
+        _, reconstructed_output = self.autoencoder_network(autoencoder_x)
+        reconstruction_loss = self.loss(reconstructed_output, autoencoder_x)
+        kld = 4 * self.autoencoder_network.kld_loss(autoencoder_x)
+        total_loss = total_loss + self._get_autoencoder_alpha() * (reconstruction_loss + kld)
+
+        # classification
+        encoded_output, _ = self.autoencoder_network(x)
+        outputs = torch.sigmoid(self.network(encoded_output))
+        classification_loss = (1 - self._get_autoencoder_alpha()) * torch.mean(self.robust_loss.lossfun(outputs-y))
+
+        # batch effect correction
+        onehot_output = torch.log_softmax(self.batch_network(encoded_output), 1)
+        batch_loss = torch.clamp(-self.second_loss(onehot_output, onehot_decoder_indexes.argmax(1)), -1)
+
+        total_loss = total_loss + classification_loss + 0.01 * batch_loss
+
+        if self.type == 'vqvae':
+            loss, encode_features, persplexity, _ = encoded_output
+            total_loss = total_loss + loss
+
+        self.log('train_loss', total_loss)
+        self.log('train_kld_loss', kld)
+        self.log('train_reconstruction_loss', reconstruction_loss)
+        self.log('train_classification_loss', classification_loss)
+        self.log('alpha', self.robust_loss.alpha()[0,0].data, prog_bar=True)
+        self.log('scale', self.robust_loss.scale()[0,0].data, prog_bar=True)
+        wandb.log({"train_loss": total_loss, 'train_kld_loss': kld,
+                   'train_reconstruction_loss': reconstruction_loss, 'train_classification_loss': classification_loss})
+        return total_loss
+
+    def validation_step(self, val_batch, batch_index):
+        x, onehot_decoder_indexes, y = val_batch
+        encoded_output, _ = self.autoencoder_network(x)
+        outputs = torch.sigmoid(self.network(encoded_output))
+
+        classification_loss = self.binary_loss(outputs, y)
+        loss = classification_loss # + kld_loss
+        self.val_losses.append(loss)
+
+        self.log('val_loss', loss)
+        # self.log('train_contrast_loss', contrast_loss)
+        wandb.log({"val_loss": loss})
+        return loss
 
 
 class LightningJointAutoencoderNetwork(LightningNetwork):
@@ -913,30 +1066,24 @@ class MultiAutoencoderNetwork(nn.Module):
 class AutoencoderNetwork(nn.Module):
     def __init__(self, input_shape, output_shape, hidden_size, network_type='normal'):
         super(AutoencoderNetwork, self).__init__()
-
         self.network_type = network_type
+        self.hidden_size = hidden_size
 
+        self._initialize_network(input_shape, hidden_size)
+
+    def _initialize_network(self, input_shape, hidden_size):
         encoder = [nn.Linear(input_shape, 2 * hidden_size), nn.ReLU(),
                    nn.Linear(2 * hidden_size, hidden_size), nn.ReLU()]
 
         if self.network_type == 'vqvae':
             encoder.append(VectorQuantizer(64, hidden_size, 0.25))
         self.encoder = nn.Sequential(*encoder)
-        # self.mean_layer = nn.Linear(hidden_size, hidden_size)
-        # self.log_var_layer = nn.Linear(hidden_size, hidden_size)
 
         decoder = [nn.Linear(hidden_size, 2 * hidden_size), nn.ReLU(),
                    nn.Linear(2 * hidden_size, input_shape)]
         self.decoder = nn.Sequential(*decoder)
-        self.optim = torch.optim.Adam(self.parameters())#torch.optim.Adam(list(self.encoder.parameters()) + list(self.decoder.parameters()))
-
         # loss
         self.loss = nn.BCELoss()
-
-    def reparameterization(self, mean, log_var):
-        epsilon = torch.randn_like(log_var)
-        z = mean + log_var * epsilon
-        return z
 
     def get_encoded_features(self, inputs):
         if self.network_type == 'vqvae':
@@ -945,14 +1092,11 @@ class AutoencoderNetwork(nn.Module):
         else:
             encoded = self.encoder(inputs)
             return encoded
-        # mean, log_var = self.mean_layer(encoded), self.log_var_layer(encoded)
-        # return mean, log_var, self.reparameterization(mean, log_var)
 
     def decode(self, encoded_features):
         return self.decoder(encoded_features)
 
     def forward(self, inputs):
-        # mean, log_var, encoded_output = self.get_encoded_features(inputs)
         encoded_output = self.get_encoded_features(inputs)
         if self.type == 'vqvae':
             _, encoded_features, _ = encoded_output
@@ -961,7 +1105,44 @@ class AutoencoderNetwork(nn.Module):
             reconstructed_output = self.decoder(encoded_output)
 
         return encoded_output, reconstructed_output
-        # return mean, log_var, encoded_output, reconstructed_output
+
+
+class VariationalAutoencoderNetwork(AutoencoderNetwork):
+    
+    def __init__(self, input_shape, output_shape, hidden_size, network_type='normal'):
+        super(VariationalAutoencoderNetwork, self).__init__(input_shape, output_shape, hidden_size,
+                                                            network_type='normal')
+
+    def _initialize_network(self, input_shape, hidden_size):
+        encoder = [nn.Linear(input_shape, 2 * hidden_size), nn.ReLU(),
+                   nn.Linear(2 * hidden_size, hidden_size), nn.ReLU(),
+                   nn.Linear(hidden_size, 2 * hidden_size)]
+
+        self.encoder = nn.Sequential(*encoder)
+
+        decoder = [nn.Linear(hidden_size, 2 * hidden_size), nn.ReLU(),
+                   nn.Linear(2 * hidden_size, input_shape)]
+        self.decoder = nn.Sequential(*decoder)
+        # loss
+        self.loss = nn.BCELoss()
+    
+    def reparameterization(self, mean, log_var):
+        std = torch.exp(0.5 * log_var)
+        epsilon = torch.randn_like(std)
+        z = mean + std * epsilon
+        return z
+
+    def get_encoded_features(self, inputs):
+        encoded = self.encoder(inputs)
+        mean, log_var = torch.split(encoded, self.hidden_size, dim=1)
+        encoded = self.reparameterization(mean, log_var)
+        return encoded
+
+    def kld_loss(self, inputs):
+        encoded = self.encoder(inputs)
+        mean, log_var = torch.split(encoded, self.hidden_size, dim=1)
+        kld = -0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
+        return kld
 
 
 class ConditionalNetwork(AutoencoderNetwork):
@@ -982,7 +1163,7 @@ class ConditionalNetwork(AutoencoderNetwork):
         decoder = [nn.Linear(hidden_size + condition_latent_size, 2 * hidden_size), nn.ReLU(),
                    nn.Linear(2 * hidden_size, input_shape)]
         self.decoder = nn.Sequential(*decoder)
-        self.optim = torch.optim.Adam(self.parameters())#torch.optim.Adam(list(self.encoder.parameters()) + list(self.decoder.parameters()))
+        self.optim = torch.optim.Adam(self.parameters())
 
         # loss
         self.loss = nn.BCELoss()
