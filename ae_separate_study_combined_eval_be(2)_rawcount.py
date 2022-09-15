@@ -35,7 +35,7 @@ else:
 
 
 autoencoder_latent_shape = 20
-hidden_size = 256
+hidden_size = 128
 num_layers = 3
 
 colors = ['r', 'g', 'm', 'k', 'y']
@@ -57,6 +57,20 @@ for unique_label in unique_labels:
     current_study_features.iloc[:, 3:] = scaled_current_study_features
     data[data['Study_name'] == unique_label] = current_study_features
 features = data.values[:, 3:].astype(np.float32)
+
+###
+# pca = PCA(2)
+# latent_pca = pca.fit_transform(features)
+# study_group_labels = one_hot_decoder_indexes.argmax(1)
+# plt.clf()
+# for label in np.unique(study_group_labels):
+#     indexes = np.where(study_group_labels == label)[0]
+#     plt.xlabel('pca 1')
+#     plt.ylabel('pca 2')
+#     plt.scatter(latent_pca[indexes, 0], latent_pca[indexes, 1], label=unique_labels[label], color=colors[label])
+# plt.legend()
+# plt.show()
+###
 
 all_data = [features.astype(np.float32)]  # only get the values for batch correction
 

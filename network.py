@@ -11,6 +11,7 @@ from ranger21 import Ranger21
 
 from vqvae import VectorQuantizer
 from losses import SupConLoss
+from mmd_loss import MMD_loss
 
 
 class LightningNetwork(pl.LightningModule):
@@ -609,26 +610,37 @@ class LightningAutoencoderCombineBENetwork(LightningAutoencoderCombineNetwork):
         optimizer = torch.optim.Adam(list(self.parameters()) + list(self.robust_loss.parameters()), lr=0.001)
         return optimizer
 
+    def _classification_loss(self):
+        ...
+
+    def _reconstruction_loss(self):
+        autoencoder_x, autoencoder_onehot_decoder_indexes, autoencoder_y = next(self.autoencoder_dataset)
+        _, reconstructed_output = self.autoencoder_network(autoencoder_x)
+        reconstruction_loss = self.loss(reconstructed_output, autoencoder_x)
+        return reconstruction_loss
+
+    def _classification_loss(self, x, y):
+        encoded_output, _ = self.autoencoder_network(x)
+        outputs = torch.sigmoid(self.network(encoded_output))
+        classification_loss = torch.mean(self.robust_loss.lossfun(outputs - y))
+        return encoded_output, classification_loss
+
     def training_step(self, train_batch, batch_index):
         x, onehot_decoder_indexes, y = train_batch
 
         total_loss = 0
         # reconstruction
-        autoencoder_x, autoencoder_onehot_decoder_indexes, autoencoder_y = next(self.autoencoder_dataset)
-        _, reconstructed_output = self.autoencoder_network(autoencoder_x)
-        reconstruction_loss = self.loss(reconstructed_output, autoencoder_x)
+        reconstruction_loss = self._reconstruction_loss()
         total_loss = total_loss + self._get_autoencoder_alpha() * reconstruction_loss
 
         # classification
-        encoded_output, _ = self.autoencoder_network(x)
-        outputs = torch.sigmoid(self.network(encoded_output))
-        classification_loss = (1 - self._get_autoencoder_alpha()) * torch.mean(self.robust_loss.lossfun(outputs-y))
+        encoded_output, classification_loss = self._classification_loss(x, y)
 
         # batch effect correction
         onehot_output = torch.log_softmax(self.batch_network(encoded_output), 1)
         batch_loss = torch.clamp(-self.second_loss(onehot_output, onehot_decoder_indexes.argmax(1)), -1)
 
-        total_loss = total_loss + classification_loss + 0.01 * batch_loss
+        total_loss = total_loss + (1 - self._get_autoencoder_alpha()) * classification_loss + 0.01 * batch_loss
 
         if self.type == 'vqvae':
             loss, encode_features, persplexity, _ = encoded_output
@@ -657,6 +669,49 @@ class LightningAutoencoderCombineBENetwork(LightningAutoencoderCombineNetwork):
         # self.log('train_contrast_loss', contrast_loss)
         wandb.log({"val_loss": loss})
         return loss
+
+
+class LightningAutoencoderCombineBEMMDNetwork(LightningAutoencoderCombineBENetwork):
+    def __init__(self, input_shape, output_shape, condition_latent_size, num_layers, latent_size, hidden_size,
+                 network_type='normal'):
+        super(LightningAutoencoderCombineBEMMDNetwork, self).__init__(input_shape,
+                                                                      output_shape, condition_latent_size,
+                                                                      num_layers, latent_size, hidden_size,
+                 network_type=network_type)
+        self.mmd_loss = MMD_loss()
+
+    def training_step(self, train_batch, batch_index):
+        x, onehot_decoder_indexes, y = train_batch
+
+        total_loss = 0
+        # reconstruction
+        reconstruction_loss = self._reconstruction_loss()
+        total_loss = total_loss + self._get_autoencoder_alpha() * reconstruction_loss
+
+        # classification
+        encoded_output, classification_loss = self._classification_loss(x, y)
+
+        # batch effect correction
+        onehot_output = torch.log_softmax(self.batch_network(encoded_output), 1)
+        batch_loss = self.second_loss(onehot_output, onehot_decoder_indexes.argmax(1))
+        total_loss = total_loss + (1 - self._get_autoencoder_alpha()) * classification_loss + 0.01 * batch_loss
+
+        encoded_output, _ = self.autoencoder_network(x)
+
+        mmd_loss = self.mmd_loss(encoded_output, encoded_output)
+        total_loss = total_loss + 0.01 * mmd_loss
+
+        self.log('train_loss', total_loss)
+        self.log('train_reconstruction_loss', reconstruction_loss)
+        self.log('train_classification_loss', classification_loss)
+        self.log('train_mmd_loss', mmd_loss)
+        wandb.log({"train_loss": total_loss,
+                   'train_reconstruction_loss': reconstruction_loss,
+                   'train_classification_loss': classification_loss,
+                   'train_mmd_loss': mmd_loss,
+                   'alpha': self.robust_loss.alpha()[0, 0].data,
+                   'scale': self.robust_loss.scale()[0, 0].data})
+        return total_loss
 
 
 class LightningVAutoencoderCombineBENetwork(LightningAutoencoderCombineNetwork):
