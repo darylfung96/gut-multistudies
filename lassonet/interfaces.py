@@ -16,9 +16,10 @@ from sklearn.base import (
 from sklearn.model_selection import check_cv, train_test_split
 import torch
 from tqdm import tqdm
+from robust_loss_pytorch.adaptive import AdaptiveLossFunction
 
-from .model import LassoNet
-from .cox import CoxPHLoss, concordance_index
+from lassonet.model import LassoNet
+from lassonet.cox import CoxPHLoss, concordance_index
 
 
 def abstractattr(f):
@@ -77,6 +78,7 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
         torch_seed=None,
         class_weight=None,
         tie_approximation=None,
+        loss='ce',
     ):
         """
         Parameters
@@ -151,6 +153,8 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
         self.dropout = dropout
         self.batch_size = batch_size
         self.optim = optim
+        self.loss_name = loss
+
         if optim is None:
             optim = (
                 partial(torch.optim.Adam, lr=1e-3),
@@ -191,9 +195,15 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
                 self, LassoNetClassifier
             ), "Weighted loss is only for classification"
             self.class_weight = torch.FloatTensor(self.class_weight).to(self.device)
-            self.criterion = torch.nn.CrossEntropyLoss(
-                weight=self.class_weight, reduction="mean"
-            )
+
+            if loss == 'robust':
+                self.robust_loss = AdaptiveLossFunction(num_dims=2, float_dtype=np.float32, device='cpu')
+                self.criterion = lambda x, y: self.robust_loss.lossfun(x-y)
+            elif loss == 'ce':
+                self.criterion = torch.nn.CrossEntropyLoss(
+                    weight=self.class_weight, reduction="mean"
+                )
+
         if isinstance(self, LassoNetCoxRegressor):
             assert (
                 self.batch_size is None
@@ -265,9 +275,11 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
         model = self.model
 
         def validation_obj():
+            n_values = y_val.max().item() + 1
+            onehot_yval = torch.from_numpy(np.eye(n_values)[y_val.cpu().numpy()].astype(np.float32))
             with torch.no_grad():
                 return (
-                    self.criterion(model(X_val), y_val).item()
+                    torch.mean(self.criterion(model(X_val).cpu(), onehot_yval)).item()
                     + lambda_ * model.l1_regularization_skip().item()
                     + self.gamma * model.l2_regularization().item()
                     + self.gamma_skip * model.l2_regularization_skip().item()
@@ -300,9 +312,12 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
 
                 def closure():
                     nonlocal loss
+                    n_values = y_train.max().item() + 1
+                    onhot_ytrain = torch.Tensor(np.eye(n_values)[y_train.cpu().numpy()].astype(np.float32)).\
+                        to(next(model.parameters()).device)
                     optimizer.zero_grad()
                     ans = (
-                        self.criterion(model(X_train[batch]), y_train[batch])
+                        torch.mean(self.criterion(model(X_train[batch]).cpu(), onhot_ytrain[batch].cpu()))
                         + self.gamma * model.l2_regularization()
                         + self.gamma_skip * model.l2_regularization_skip()
                     )
@@ -369,6 +384,7 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
         lambda_max=float("inf"),
         return_state_dicts=True,
         callback=None,
+        loss='robust'  # 'ce, robust'
     ) -> List[HistoryItem]:
         """Train LassoNet on a lambda\_ path.
         The path is defined by the class parameters:
@@ -396,6 +412,10 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
         # always init model
         self._init_model(X_train, y_train)
 
+        optimize_params = list(self.model.parameters())
+        if self.loss_name == 'robust':
+            optimize_params = optimize_params + list(self.robust_loss.parameters())
+
         hist.append(
             self._train(
                 X_train,
@@ -405,7 +425,7 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
                 batch_size=self.batch_size,
                 lambda_=0,
                 epochs=self.n_iters_init,
-                optimizer=self.optim_init(self.model.parameters()),
+                optimizer=self.optim_init(optimize_params),
                 patience=self.patience_init,
                 return_state_dict=return_state_dicts,
             )

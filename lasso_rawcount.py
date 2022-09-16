@@ -15,17 +15,20 @@ from sklearn import metrics
 from mpl_toolkits import mplot3d
 import matplotlib.pyplot as plt
 import wandb
+import matplotlib
 from sklearn.metrics import roc_auc_score
 
 from training import leave_one_dataset_out, train_one_test_all
-from lassonet.interfaces import LassoNetClassifierCV
+from lassonet.interfaces import LassoNetClassifier
 
 wandb.login()
+torch.cuda.is_available()
 
 current_dataset = 'plaque'  # joined or plaque or siamcat
 type_data = 'species'  # genus or species
 is_impute = False
-training_type = 'TOTA'  # LODO / TOTA
+training_type = 'LODO'  # LODO / TOTA
+loss = 'ce'
 
 if current_dataset == 'joined':
     data = pd.read_csv(f'raw_combined data/Joined_5_Plaque_{type_data}_level_OTUs_RA_with_disease_n_study.txt', sep='\t')
@@ -39,7 +42,7 @@ else:
 
 
 autoencoder_latent_shape = 40
-hidden_size = 128
+hidden_size = 256
 num_layers = 3
 
 colors = ['r', 'g', 'm', 'k', 'y']
@@ -101,7 +104,7 @@ for idx, current_data in enumerate(all_data):
     # autoencoder_trainer.fit(autoencoder_network, dataloader)
     result_matrices = []
     for unique_label in unique_labels:
-        wandb.init(name=f'WD_separate_{unique_label}_{training_type}_lassonet_raw', project='wasif_data',
+        wandb.init(name=f'WD_separate_{unique_label}_{training_type}_lassonet_raw_{loss}', project='wasif_data',
                    group=f'{current_dataset} {type_data} '
                          f'{"impute" if is_impute else ""}'
                          f'num layers: {num_layers} '
@@ -112,7 +115,8 @@ for idx, current_data in enumerate(all_data):
         np.random.seed(100)
         random.seed(100)
         torch.random.manual_seed(100)
-        lassonet = LassoNetClassifierCV()
+        lassonet = LassoNetClassifier(hidden_dims=tuple([hidden_size] * num_layers), loss=loss)
+
 
         test_index = data.index[data['Study_name'] == unique_label].values
         train_index = data.index[data['Study_name'] != unique_label].values
@@ -140,7 +144,7 @@ for idx, current_data in enumerate(all_data):
             lassonet.load(save.state_dict)
             y_pred = lassonet.predict(val_features)
             n_selected.append(save.selected.sum())
-            auc.append(roc_auc_score(val_labels.argmax(1), y_pred))
+            auc.append(roc_auc_score(val_labels.argmax(1), y_pred.cpu().numpy()))
             lambda_.append(save.lambda_)
 
         fig = plt.figure(figsize=(12, 12))
@@ -148,9 +152,9 @@ for idx, current_data in enumerate(all_data):
         plt.grid(True)
         plt.plot(n_selected, auc, ".-")
         plt.xlabel("number of selected features")
-        plt.ylabel("classification accuracy")
+        plt.ylabel("classification auc")
 
-        wandb.log({f'{unique_label} lassonet': wandb.Image(plt)})
+        wandb.log({f'selected features vs auc': wandb.Image(plt)})
         plt.clf()
         plt.cla()
 
@@ -161,18 +165,20 @@ for idx, current_data in enumerate(all_data):
         importances = importances[order]
         ordered_feature_names = [feature_names[i] for i in order]
         color = np.array(["g"] * n_features)[order]
+        top_num = 100
         plt.bar(
-            np.arange(n_features),
-            importances,
+            np.arange(n_features)[:top_num],
+            importances[:top_num],
             color=color,
         )
-        plt.xticks(np.arange(n_features), ordered_feature_names, rotation=90)
+        plt.xticks(np.arange(n_features)[:top_num], ordered_feature_names[:top_num], rotation=90)
         colors = {"real features": "g", "fake features": "r"}
         labels = list(colors.keys())
         # handles = [plt.Rectangle((0, 0), 1, 1, color=colors[label]) for label in labels]
         # plt.legend(handles, labels)
         plt.ylabel("Feature importance")
-        wandb.log({f'{unique_label} lassonet feature importances': wandb.Image(plt)})
+        plt.rcParams.update({'font.size': 8})
+        wandb.log({f'feature importances': wandb.Image(plt)})
 
         # if training_type == 'LODO':
         #     result_matrix = leave_one_dataset_out(network, data, current_data, label_encoder, encoded_labels, one_hot_decoder_indexes,
