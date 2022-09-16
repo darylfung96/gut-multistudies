@@ -63,6 +63,7 @@ for unique_label in unique_labels:
     current_study_features.iloc[:, 7:] = scaled_current_study_features  # 3 for siamcat, 7 for plaque
     data[data['Study_name'] == unique_label] = current_study_features
 features = data.values[:, 7:].astype(np.float32)  # 3 for siamcat, 7 for plaque
+feature_names = data.columns[7:]
 
 ###
 pca = PCA(3)
@@ -151,6 +152,28 @@ for idx, current_data in enumerate(all_data):
 
         wandb.log({f'{unique_label} lassonet': wandb.Image(plt)})
         plt.clf()
+        plt.cla()
+
+        # plot feature importances
+        n_features = train_features.shape[1]
+        importances = lassonet.feature_importances_.numpy()
+        order = np.argsort(importances)[::-1]
+        importances = importances[order]
+        ordered_feature_names = [feature_names[i] for i in order]
+        color = np.array(["g"] * n_features)[order]
+        plt.bar(
+            np.arange(n_features),
+            importances,
+            color=color,
+        )
+        plt.xticks(np.arange(n_features), ordered_feature_names, rotation=90)
+        colors = {"real features": "g", "fake features": "r"}
+        labels = list(colors.keys())
+        # handles = [plt.Rectangle((0, 0), 1, 1, color=colors[label]) for label in labels]
+        # plt.legend(handles, labels)
+        plt.ylabel("Feature importance")
+        wandb.log({f'{unique_label} lassonet feature importances': wandb.Image(plt)})
+
         # if training_type == 'LODO':
         #     result_matrix = leave_one_dataset_out(network, data, current_data, label_encoder, encoded_labels, one_hot_decoder_indexes,
         #                        unique_label, unique_labels, colors)
