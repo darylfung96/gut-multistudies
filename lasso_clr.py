@@ -164,7 +164,7 @@ for idx, current_data in enumerate(all_data):
         # get encoded/batch features plot
         if autoencoder_sizes or is_batch_loss:
             pca = PCA(2)
-            latent_pca = pca.fit_transform(encoded_features)
+            latent_pca = pca.fit_transform(encoded_features.cpu())
             study_group_labels = one_hot_decoder_indexes.argmax(1)
             plt.clf()
             for label in np.unique(study_group_labels):
