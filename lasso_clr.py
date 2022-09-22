@@ -29,13 +29,17 @@ current_dataset = 'plaque'  # joined or plaque or siamcat
 type_data = 'species'  # genus or species
 is_impute = False
 training_type = 'LODO'  # LODO / TOTA
-loss = 'robust'
-optim_name = 'ranger'
+loss = 'ce'
+optim_name = 'adam'
+is_batch_loss = True
+autoencoder_sizes = None # (128, 128, 3)  # or None
+
+batch_loss_text = 'bl' if is_batch_loss else ''
 
 if current_dataset == 'joined':
     data = pd.read_csv(f'raw_combined data/Joined_5_Plaque_{type_data}_level_OTUs_RA_with_disease_n_study.txt', sep='\t')
 elif current_dataset == 'plaque':
-    data = pd.read_csv(f'raw_combined data/Plaque_species_raw_count_OTU_table_with_meta_data.txt', sep='\t')
+    data = pd.read_csv(f'raw_combined data/Joined_Plaque_Species_meta_RA_clr.txt', sep='\t')
     # data = pd.read_csv(f'raw_combined data/Plaque_union_Joined5_{type_data}_raw_relative_abundacne.txt', sep='\t')
 elif current_dataset == 'siamcat':
     data = pd.read_csv(f'raw_combined data/siamcat_meta_feat.txt', sep='\t')
@@ -60,28 +64,30 @@ decoder_indexes = data['Study_name'].apply(lambda x:  np.where(unique_labels == 
 one_hot_decoder_indexes = np.eye(np.max(decoder_indexes)+1)[decoder_indexes].astype(np.float32)
 
 # normalize within each study group
+# NO NEED TO NORMALIZE FOR CLR
 # TODO make sure to change 7 when using different data
-for unique_label in unique_labels:
-    current_study_features = data[data['Study_name'] == unique_label]
-    scale = StandardScaler()
-    scaled_current_study_features = scale.fit_transform(current_study_features.values[:, 7:])  # 3 for siamcat, 7 for plaque
-    current_study_features.iloc[:, 7:] = scaled_current_study_features  # 3 for siamcat, 7 for plaque
-    data[data['Study_name'] == unique_label] = current_study_features
+# for unique_label in unique_labels:
+#     current_study_features = data[data['Study_name'] == unique_label]
+#     scale = StandardScaler()
+#     scaled_current_study_features = scale.fit_transform(current_study_features.values[:, 7:])  # 3 for siamcat, 7 for plaque
+#     current_study_features.iloc[:, 7:] = scaled_current_study_features  # 3 for siamcat, 7 for plaque
+#     data[data['Study_name'] == unique_label] = current_study_features
 features = data.values[:, 7:].astype(np.float32)  # 3 for siamcat, 7 for plaque
 feature_names = data.columns[7:]
 
 ###
-pca = PCA(3)
+pca = PCA(2)
 latent_pca = pca.fit_transform(features)
 study_group_labels = one_hot_decoder_indexes.argmax(1)
 plt.clf()
-ax = plt.axes(projection ="3d")
+# ax = plt.axes(projection ="3d")
 for label in np.unique(study_group_labels):
     indexes = np.where(study_group_labels == label)[0]
     plt.xlabel('pca 1')
     plt.ylabel('pca 2')
-    ax.scatter3D(latent_pca[indexes, 0], latent_pca[indexes, 1], latent_pca[indexes, 2],
-                 label=unique_labels[label], color=colors[label])
+    # ax.scatter3D(latent_pca[indexes, 0], latent_pca[indexes, 1], latent_pca[indexes, 2],
+    #              label=unique_labels[label], color=colors[label])
+    plt.scatter(latent_pca[indexes, 0], latent_pca[indexes, 1], s=latent_pca[indexes, 0].shape[0], label=unique_labels[label], color=colors[label])
 plt.legend()
 plt.show()
 ###
@@ -108,7 +114,7 @@ for idx, current_data in enumerate(all_data):
     best_table = []
 
     for unique_label in unique_labels:
-        wandb.init(name=f'WD_separate_{unique_label}_{training_type}_lassonet_raw_{loss}_{optim_name}', project='wasif_data',
+        wandb.init(name=f'WD_separate_{unique_label}_{training_type}_lassonet_clr_{batch_loss_text}_{loss}_{optim_name}', project='wasif_data',
                    group=f'{current_dataset} {type_data} '
                          f'{"impute" if is_impute else ""}'
                          f'num layers: {num_layers} '
@@ -124,7 +130,9 @@ for idx, current_data in enumerate(all_data):
         elif optim_name == 'ranger':
             ranger21_func = lambda *args, **kw: Ranger21(*args, **kw, lr=0.001, num_epochs=200, num_batches_per_epoch=5)
             optim = (ranger21_func, ranger21_func)
-        lassonet = LassoNetClassifier(hidden_dims=tuple([hidden_size] * num_layers), loss=loss, optim=optim)
+        lassonet = LassoNetClassifier(hidden_dims=tuple([hidden_size] * num_layers), loss=loss, optim=optim,
+                                      autoencoder_sizes=autoencoder_sizes, is_batch_loss=is_batch_loss,
+                                      condition_latent_size=one_hot_decoder_indexes.shape[1])
 
 
         test_index = data.index[data['Study_name'] == unique_label].values
@@ -144,7 +152,29 @@ for idx, current_data in enumerate(all_data):
         val_labels = encoded_labels[test_index]
         val_tensor_encoded_labels = torch.from_numpy(val_labels)
 
-        path = lassonet.path(train_features, train_labels.argmax(1))
+        path = lassonet.path(train_features, train_labels.argmax(1),
+                             train_one_hot_decoder_indexes=torch.from_numpy(train_one_hot_decoder_indexes))
+
+        # get batch features
+        if is_batch_loss:
+            encoded_features = lassonet.get_layer_features(torch.from_numpy(current_data))
+        elif autoencoder_sizes:
+            encoded_features = lassonet.get_encoded_features(torch.from_numpy(current_data))
+
+        # get encoded/batch features plot
+        if autoencoder_sizes or is_batch_loss:
+            pca = PCA(2)
+            latent_pca = pca.fit_transform(encoded_features)
+            study_group_labels = one_hot_decoder_indexes.argmax(1)
+            plt.clf()
+            for label in np.unique(study_group_labels):
+                indexes = np.where(study_group_labels == label)[0]
+                plt.xlabel('pca 1')
+                plt.ylabel('pca 2')
+                plt.scatter(latent_pca[indexes, 0], latent_pca[indexes, 1], s=latent_pca[indexes, 0].shape[0],
+                            label=unique_labels[label], color=colors[label])
+            plt.legend()
+            plt.show()
 
         n_selected = []
         auc = []
@@ -192,8 +222,6 @@ for idx, current_data in enumerate(all_data):
             color=color,
         )
         plt.xticks(np.arange(n_features)[:top_num], ordered_feature_names[:top_num], rotation=90)
-        colors = {"real features": "g", "fake features": "r"}
-        labels = list(colors.keys())
         # handles = [plt.Rectangle((0, 0), 1, 1, color=colors[label]) for label in labels]
         # plt.legend(handles, labels)
         plt.ylabel("Feature importance")
@@ -210,8 +238,6 @@ for idx, current_data in enumerate(all_data):
             color=color,
         )
         plt.xticks(np.arange(n_features)[:top_num], ordered_feature_names[:top_num], rotation=90)
-        colors = {"real features": "g", "fake features": "r"}
-        labels = list(colors.keys())
         # handles = [plt.Rectangle((0, 0), 1, 1, color=colors[label]) for label in labels]
         # plt.legend(handles, labels)
         plt.ylabel("Feature importance")

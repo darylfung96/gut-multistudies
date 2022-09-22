@@ -20,15 +20,20 @@ from network import LightningNetwork, LightningAutoencoderCombineBEMMDNetwork, L
 
 wandb.login()
 
-current_dataset = 'siamcat'  # joined or plaque or siamcat
+current_dataset = 'plaque'  # joined or plaque or siamcat
 type_data = 'species'  # genus or species
 is_impute = False
-training_type = 'TOTA'  # LODO / TOTA
+training_type = 'LODO'  # LODO / TOTA
+normalization_type = 'clr'
+network_batch_effect = 'bce'  # mmd or bce
 
 if current_dataset == 'joined':
     data = pd.read_csv(f'raw_combined data/Joined_5_Plaque_{type_data}_level_OTUs_RA_with_disease_n_study.txt', sep='\t')
 elif current_dataset == 'plaque':
-    data = pd.read_csv(f'raw_combined data/Plaque_species_raw_count_OTU_table_with_meta_data.txt', sep='\t')
+    if normalization_type == 'raw':
+        data = pd.read_csv('raw_combined data/Plaque_species_raw_count_OTU_table_with_meta_data.txt', sep='\t')
+    elif normalization_type == 'clr':
+        data = pd.read_csv('raw_combined data/Joined_Plaque_Species_meta_RA_clr.txt', sep='\t')
     # data = pd.read_csv(f'raw_combined data/Plaque_union_Joined5_{type_data}_raw_relative_abundacne.txt', sep='\t')
 elif current_dataset == 'siamcat':
     data = pd.read_csv(f'raw_combined data/siamcat_meta_feat.txt', sep='\t')
@@ -36,8 +41,8 @@ else:
     raise Exception('Use either "joined" or "plaque" for current_dataset.')
 
 
-autoencoder_latent_shape = 40
-hidden_size = 128
+autoencoder_latent_shape = 128
+hidden_size = 256
 num_layers = 3
 
 colors = ['r', 'g', 'm', 'k', 'y']
@@ -46,7 +51,7 @@ label_encoder = OneHotEncoder()
 encoded_labels = label_encoder.fit_transform(labels).toarray().astype(np.float32)
 
 #TOOD make sure to change 6 when using different data
-unique_labels = np.unique(data.values[:, 2]) # 6 for plaque, 2 for siamcat
+unique_labels = np.unique(data.values[:, 6])  # 6 for plaque, 2 for siamcat
 if current_dataset == 'siamcat':
     unique_labels = np.array(['metaHIT', 'Lewis_2015', 'He_2017', 'HMP2', 'Franzosa_2019'])
 decoder_indexes = data['Study_name'].apply(lambda x:  np.where(unique_labels == x)[0][0]).values
@@ -57,10 +62,10 @@ one_hot_decoder_indexes = np.eye(np.max(decoder_indexes)+1)[decoder_indexes].ast
 for unique_label in unique_labels:
     current_study_features = data[data['Study_name'] == unique_label]
     scale = StandardScaler()
-    scaled_current_study_features = scale.fit_transform(current_study_features.values[:, 3:])  # 3 for siamcat, 7 for plaque
-    current_study_features.iloc[:, 3:] = scaled_current_study_features  # 3 for siamcat, 7 for plaque
+    scaled_current_study_features = scale.fit_transform(current_study_features.values[:, 7:])  # 3 for siamcat, 7 for plaque
+    current_study_features.iloc[:, 7:] = scaled_current_study_features  # 3 for siamcat, 7 for plaque
     data[data['Study_name'] == unique_label] = current_study_features
-features = data.values[:, 3:].astype(np.float32)  # 3 for siamcat, 7 for plaque
+features = data.values[:, 7:].astype(np.float32)  # 3 for siamcat, 7 for plaque
 
 ###
 pca = PCA(2)
@@ -96,7 +101,7 @@ for idx, current_data in enumerate(all_data):
     # autoencoder_trainer.fit(autoencoder_network, dataloader)
     result_matrices = []
     for unique_label in unique_labels:
-        wandb.init(name=f'WD_separate_{unique_label}_{training_type}_EE_bl_rb_sc_mmd_raw', project='wasif_data',
+        wandb.init(name=f'WD_separate_{unique_label}_{training_type}_EE_bl_rb_sc_{normalization_type}_{network_batch_effect}', project='wasif_data',
                    group=f'{current_dataset} {type_data} '
                          f'{"impute" if is_impute else ""}'
                          f'num layers: {num_layers} '
@@ -107,7 +112,12 @@ for idx, current_data in enumerate(all_data):
         np.random.seed(100)
         random.seed(100)
         torch.random.manual_seed(100)
-        network = LightningAutoencoderCombineBEMMDNetwork(features.shape[1], encoded_labels.shape[1],
+
+        model_creator = {
+            'mmd': LightningAutoencoderCombineBEMMDNetwork,
+            'bce': LightningAutoencoderCombineBENetwork
+        }
+        network = model_creator[network_batch_effect](features.shape[1], encoded_labels.shape[1],
                                                      one_hot_decoder_indexes.shape[1], num_layers,
                                                      autoencoder_latent_shape, hidden_size,
                                                      'normal')

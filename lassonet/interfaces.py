@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from functools import partial
 import itertools
 from typing import List
+import torch.nn as nn
 import warnings
 
 import numpy as np
@@ -17,9 +18,11 @@ from sklearn.model_selection import check_cv, train_test_split
 import torch
 from tqdm import tqdm
 from robust_loss_pytorch.adaptive import AdaptiveLossFunction
+from ranger21 import Ranger21
 
 from lassonet.model import LassoNet
 from lassonet.cox import CoxPHLoss, concordance_index
+from network import AutoencoderNetwork
 
 
 def abstractattr(f):
@@ -79,6 +82,9 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
         class_weight=None,
         tie_approximation=None,
         loss='ce',
+        autoencoder_sizes=None,
+        is_batch_loss=None,
+        condition_latent_size=None,
     ):
         """
         Parameters
@@ -140,6 +146,8 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
             There must be one number per class.
         tie_approximation: str
             Tie approximation for the Cox model, must be one of ("breslow", "efron").
+        autoencoder_sizes: (autoencoder_hidden_size, latent_size, layers), None
+            The autoencoder architecture
         """
         assert isinstance(hidden_dims, tuple), "`hidden_dims` must be a tuple"
         self.hidden_dims = hidden_dims
@@ -154,6 +162,9 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
         self.batch_size = batch_size
         self.optim = optim
         self.loss_name = loss
+        self.autoencoder_sizes = autoencoder_sizes
+        self.is_batch_loss = is_batch_loss
+        self.condition_latent_size = condition_latent_size
 
         if optim is None:
             optim = (
@@ -190,19 +201,23 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
 
         self.model = None
         self.class_weight = class_weight
+        if self.loss_name == 'robust':
+            self.robust_loss = AdaptiveLossFunction(num_dims=2, float_dtype=np.float32, device='cpu')
+            self.criterion = lambda x, y: self.robust_loss.lossfun(x - y)
+        elif loss == 'ce':
+            self.criterion = torch.nn.CrossEntropyLoss(
+                weight=self.class_weight, reduction="mean"
+            )
+
+        self.batch_criterion = None
+        if self.is_batch_loss:
+            self.batch_criterion = nn.NLLLoss()
+
         if self.class_weight is not None:
             assert isinstance(
                 self, LassoNetClassifier
             ), "Weighted loss is only for classification"
             self.class_weight = torch.FloatTensor(self.class_weight).to(self.device)
-
-            if loss == 'robust':
-                self.robust_loss = AdaptiveLossFunction(num_dims=2, float_dtype=np.float32, device='cpu')
-                self.criterion = lambda x, y: self.robust_loss.lossfun(x-y)
-            elif loss == 'ce':
-                self.criterion = torch.nn.CrossEntropyLoss(
-                    weight=self.class_weight, reduction="mean"
-                )
 
         if isinstance(self, LassoNetCoxRegressor):
             assert (
@@ -235,13 +250,31 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
             assert output_shape == len(self.class_weight)
         if self.torch_seed is not None:
             torch.manual_seed(self.torch_seed)
-        self.model = LassoNet(
-            X.shape[1],
-            *self.hidden_dims,
-            output_shape,
-            groups=self.groups,
-            dropout=self.dropout,
-        ).to(self.device)
+        import torch.nn as nn
+        if self.autoencoder_sizes:
+            self.autoencoder_model = AutoencoderNetwork(X.shape[1], output_shape=X.shape[1],
+                                                        hidden_size=self.autoencoder_sizes[1], network_type='normal',
+                                                        loss=nn.L1Loss)
+            self.model = LassoNet(
+                self.autoencoder_sizes[1],
+                *self.hidden_dims,
+                output_shape,
+                groups=self.groups,
+                dropout=self.dropout,
+                is_batch_loss=self.is_batch_loss,
+                condition_latent_size=self.condition_latent_size
+            ).to(self.device)
+        else:
+            self.model = LassoNet(
+                X.shape[1],
+                *self.hidden_dims,
+                output_shape,
+                groups=self.groups,
+                dropout=self.dropout,
+                is_batch_loss=self.is_batch_loss,
+                condition_latent_size=self.condition_latent_size,
+            ).to(self.device)
+
 
     def _cast_input(self, X, y=None):
         X = torch.FloatTensor(X).to(self.device)
@@ -270,16 +303,56 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
         lambda_,
         optimizer,
         return_state_dict,
+        one_hot_train=None,
+        one_hot_val=None,
         patience=None,
     ) -> HistoryItem:
         model = self.model
+        batch_criterion = self.batch_criterion
+
+
+        # region autoencoder_init
+        # for autoencoder
+        # generate scheduler for autoencoder and classification weights
+        def _exp_decay(epoch):
+            if epoch >= epochs:
+                return 0
+            initial_lrate = 1
+            k = 0.1
+            lrate = initial_lrate * np.exp(-k * epoch)
+            return lrate
+
+        all_epochs = np.arange(1, epochs)
+        self.autoencoder_alpha = list(reversed([_exp_decay(epoch) for epoch in all_epochs]))
+        self.autoencoder_alpha = [1 - item for item in self.autoencoder_alpha]
+        if self.autoencoder_sizes:
+            autoencoder_model = self.autoencoder_model
+            autoencoder_alpha = self.autoencoder_alpha
+        # endregion autoencoder_init
 
         def validation_obj():
             n_values = y_val.max().item() + 1
             onehot_yval = torch.from_numpy(np.eye(n_values)[y_val.cpu().numpy()].astype(np.float32))
             with torch.no_grad():
+                # pass x into autoencoder
+                if self.autoencoder_sizes:
+                    # autoencoder_value = autoencoder_alpha[n_iters] if n_iters < epochs else 0
+                    # inverse_autoencoder_value = 1 - autoencoder_value
+                    #
+                    # encoded_features, reconstructed_features = autoencoder_model(X_val)
+                    # autoencoder_loss = torch.mean(
+                    #     autoencoder_value * autoencoder_model.loss(reconstructed_features, X_val))
+                    # current_X = encoded_features
+                    ...
+                    encoded_features, _ = autoencoder_model(X_val)
+                    current_X = encoded_features
+                else:
+                    autoencoder_loss = 0
+                    inverse_autoencoder_value = 1
+                    current_X = X_val
+
                 return (
-                    torch.mean(self.criterion(model(X_val).cpu(), onehot_yval)).item()
+                    torch.mean(self.criterion(model(current_X).cpu(), onehot_yval)).item()
                     + lambda_ * model.l1_regularization_skip().item()
                     + self.gamma * model.l2_regularization().item()
                     + self.gamma_skip * model.l2_regularization_skip().item()
@@ -316,8 +389,30 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
                     onhot_ytrain = torch.Tensor(np.eye(n_values)[y_train.cpu().numpy()].astype(np.float32)).\
                         to(next(model.parameters()).device)
                     optimizer.zero_grad()
+
+                    # pass x into autoencoder
+                    if self.autoencoder_sizes:
+                        autoencoder_value = autoencoder_alpha[n_iters] if n_iters < epochs else 0
+                        inverse_autoencoder_value = 1 - autoencoder_value
+
+                        encoded_features, reconstructed_features = autoencoder_model(X_train[batch])
+                        autoencoder_loss = torch.mean(autoencoder_value * autoencoder_model.loss(reconstructed_features, X_train[batch]))
+                        current_X = encoded_features
+                    else:
+                        autoencoder_loss = 0
+                        inverse_autoencoder_value = 1
+                        current_X = X_train[batch]
+
+                    if self.is_batch_loss:
+                        onehot_output = torch.log_softmax(model.forward_batch(current_X), 1)
+                        batch_loss = 0.01 * torch.clamp(-batch_criterion(onehot_output, one_hot_train.argmax(1)), -1)
+                    else:
+                        batch_loss = 0
+
                     ans = (
-                        torch.mean(self.criterion(model(X_train[batch]).cpu(), onhot_ytrain[batch].cpu()))
+                        autoencoder_loss +
+                        batch_loss +
+                        inverse_autoencoder_value * torch.mean(self.criterion(model(current_X).cpu(), onhot_ytrain[batch].cpu()))
                         + self.gamma * model.l2_regularization()
                         + self.gamma_skip * model.l2_regularization_skip()
                     )
@@ -378,6 +473,7 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
         X,
         y,
         *,
+        train_one_hot_decoder_indexes=None,
         X_val=None,
         y_val=None,
         lambda_seq=None,
@@ -397,13 +493,20 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
         ), "You must specify both or none of X_val and y_val"
         sample_val = self.val_size != 0 and X_val is None
         if sample_val:
-            X_train, X_val, y_train, y_val = train_test_split(
-                X, y, test_size=self.val_size, random_state=self.random_state
-            )
+            if train_one_hot_decoder_indexes is not None:
+                X_train, X_val, y_train, y_val, one_hot_train, one_hot_val = train_test_split(
+                    X, y, train_one_hot_decoder_indexes, test_size=self.val_size, random_state=self.random_state
+                )
+            else:
+                X_train, X_val, y_train, y_val = train_test_split(
+                    X, y, test_size=self.val_size, random_state=self.random_state
+                )
         elif X_val is None:
             X_train, y_train = X_val, y_val = X, y
+            one_hot_train, one_hot_val = None, None
         else:
             X_train, y_train = X, y
+            one_hot_train, one_hot_val = None, None
         X_train, y_train = self._cast_input(X_train, y_train)
         X_val, y_val = self._cast_input(X_val, y_val)
 
@@ -415,6 +518,8 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
         optimize_params = list(self.model.parameters())
         if self.loss_name == 'robust':
             optimize_params = optimize_params + list(self.robust_loss.parameters())
+        if self.autoencoder_sizes:
+            optimize_params = optimize_params + list(self.autoencoder_model.parameters())
 
         hist.append(
             self._train(
@@ -422,6 +527,8 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
                 y_train,
                 X_val,
                 y_val,
+                one_hot_train=one_hot_train,
+                one_hot_val=one_hot_val,
                 batch_size=self.batch_size,
                 lambda_=0,
                 epochs=self.n_iters_init,
@@ -436,7 +543,7 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
             print("Initialized dense model")
             hist[-1].log()
 
-        optimizer = self.optim_path(self.model.parameters())
+        optimizer = self.optim_path(optimize_params)
 
         # build lambda_seq
         if lambda_seq is not None:
@@ -474,6 +581,8 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
                 y_train,
                 X_val,
                 y_val,
+                one_hot_train=one_hot_train,
+                one_hot_val=one_hot_val,
                 batch_size=self.batch_size,
                 lambda_=current_lambda,
                 epochs=self.n_iters_path,
@@ -485,7 +594,7 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
                 is_dense = False
                 if current_lambda / lambda_start < 2:
                     warnings.warn(
-                        f"lambda_start={self.lambda_start:.3f} "
+                        f"lambda_start={self.lambda_start} "
                         "might be too large.\n"
                         f"Features start to disappear at {current_lambda:.3f}."
                     )
@@ -587,6 +696,19 @@ class LassoNetClassifier(
     @staticmethod
     def _output_shape(y):
         return (y.max() + 1).item()
+
+    def get_encoded_features(self, X):
+        current_model = self.autoencoder_model if self.autoencoder_sizes else self.model
+
+        current_model.eval()
+        with torch.no_grad():
+            features = current_model.get_encoded_features(self._cast_input(X))
+        return features
+
+    def get_layer_features(self, X):
+        with torch.no_grad():
+            features = self.model.get_layer_features(self._cast_input(X))
+        return features
 
     def predict(self, X):
         self.model.eval()

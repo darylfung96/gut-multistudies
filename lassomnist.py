@@ -1,40 +1,34 @@
-import torch.cuda
 from sklearn.datasets import fetch_openml
-from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
+from lassonet import LassoNetAutoEncoder
+from sklearn.metrics import mean_squared_error
 import matplotlib.pyplot as plt
 
-from lassonet.interfaces import LassoNetClassifier
-
-torch.cuda.is_available()
-
 X, y = fetch_openml(name="mnist_784", return_X_y=True)
-filter = y.isin(["5", "6"])
+filter = y == "3"
 X = X[filter].values / 255
-y = LabelEncoder().fit_transform(y[filter])
 
-X_train, X_test, y_train, y_test = train_test_split(X, y)
-
-model = LassoNetClassifier(M=30, verbose=True)
-path = model.path(X_train, y_train)
+model = LassoNetAutoEncoder(
+    M=30, n_iters=(3000, 500), path_multiplier=1.05, verbose=True
+)
+path = model.path(X)
 
 img = model.feature_importances_.reshape(28, 28)
 
-plt.title("Feature importance to discriminate 5 and 6")
+plt.title("Feature importance to reconstruct 3")
 plt.imshow(img)
 plt.colorbar()
-plt.savefig("mnist-classification-importance.png")
+plt.savefig("mnist-ae-importance.png")
+
 
 n_selected = []
-accuracy = []
+score = []
 lambda_ = []
 
 for save in path:
     model.load(save.state_dict)
-    y_pred = model.predict(X_test)
+    X_pred = model.predict(X)
     n_selected.append(save.selected.sum())
-    accuracy.append(accuracy_score(y_test, y_pred))
+    score.append(mean_squared_error(X_pred, X))
     lambda_.append(save.lambda_)
 
 to_plot = [160, 220, 300]
@@ -51,22 +45,24 @@ for i, save in zip(n_selected, path):
     img = (weight[1] - weight[0]).reshape(28, 28)
     plt.imshow(img)
     plt.colorbar()
-    plt.savefig(f"mnist-classification-{i}.png")
+    plt.savefig(f"mnist-ae-{i}.png")
+
+plt.clf()
 
 fig = plt.figure(figsize=(12, 12))
 
 plt.subplot(311)
 plt.grid(True)
-plt.plot(n_selected, accuracy, ".-")
+plt.plot(n_selected, score, ".-")
 plt.xlabel("number of selected features")
-plt.ylabel("classification accuracy")
+plt.ylabel("MSE")
 
 plt.subplot(312)
 plt.grid(True)
-plt.plot(lambda_, accuracy, ".-")
+plt.plot(lambda_, score, ".-")
 plt.xlabel("lambda")
 plt.xscale("log")
-plt.ylabel("classification accuracy")
+plt.ylabel("MSE")
 
 plt.subplot(313)
 plt.grid(True)
@@ -75,4 +71,14 @@ plt.xlabel("lambda")
 plt.xscale("log")
 plt.ylabel("number of selected features")
 
-plt.savefig("mnist-classification-training.png")
+plt.savefig("mnist-ae-training.png")
+
+
+plt.subplot(221)
+plt.imshow(X[150].reshape(28, 28))
+plt.subplot(222)
+plt.imshow(model.predict(X[150]).reshape(28, 28))
+plt.subplot(223)
+plt.imshow(X[250].reshape(28, 28))
+plt.subplot(224)
+plt.imshow(model.predict(X[250]).reshape(28, 28))

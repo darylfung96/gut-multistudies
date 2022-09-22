@@ -19,14 +19,19 @@ from network import LightningNetwork, LightningAutoencoderCombineBENetwork
 
 wandb.login()
 
-current_dataset = 'siamcat'  # joined or plaque
+current_dataset = 'plaque'  # joined or plaque
 type_data = 'siamcat'  # genus or species
+normalization_type = 'raw'  # raw or clr
 is_impute = False
 
 if current_dataset == 'joined':
     data = pd.read_csv(f'raw_combined data/Joined_5_Plaque_{type_data}_level_OTUs_RA_with_disease_n_study.txt', sep='\t')
 elif current_dataset == 'plaque':
-    data = pd.read_csv(f'raw_combined data/Plaque_species_raw_count_OTU_table_with_meta_data.txt', sep='\t')
+    if normalization_type == 'raw':
+        data = pd.read_csv('raw_combined data/Plaque_species_raw_count_OTU_table_with_meta_data.txt', sep='\t')
+    elif normalization_type == 'clr':
+        data = pd.read_csv('raw_combined data/Joined_Plaque_Species_meta_RA_clr.txt', sep='\t')
+    # data = pd.read_csv(f'raw_combined data/Plaque_species_raw_count_OTU_table_with_meta_data.txt', sep='\t')
     # data = pd.read_csv(f'raw_combined data/Plaque_union_Joined5_{type_data}_raw_relative_abundacne.txt', sep='\t')
 elif current_dataset == 'siamcat':
     data = pd.read_csv(f'raw_combined data/siamcat_meta_feat.txt', sep='\t')
@@ -44,7 +49,7 @@ label_encoder = OneHotEncoder()
 encoded_labels = label_encoder.fit_transform(labels).toarray().astype(np.float32)
 
 #TOOD make sure to change 6 when using different data
-unique_labels = np.unique(data.values[:, 2])
+unique_labels = np.unique(data.values[:, 6])  # 6 for plaque, 2 for siamcat
 decoder_indexes = data['Study_name'].apply(lambda x:  np.where(unique_labels == x)[0][0]).values
 one_hot_decoder_indexes = np.eye(np.max(decoder_indexes)+1)[decoder_indexes].astype(np.float32)
 
@@ -100,8 +105,8 @@ for idx, current_data in enumerate(all_data):
     # autoencoder_trainer.fit(autoencoder_network, dataloader)
 
     for unique_label in unique_labels:
-        wandb.init(name=f'wasif_data_separate_{unique_label} endend_bl_rb_sc_raw', project='wasif_data',
-                   group=f'ae separate endend_bl_rb_sc_raw'
+        wandb.init(name=f'wasif_data_separate_{unique_label} endend_bl_rb_sc_clr', project='wasif_data',
+                   group=f'ae separate endend_bl_rb_sc_clr'
                          f'{current_dataset} {type_data} '
                          f'{"impute" if is_impute else ""}'
                          f'num layers: {num_layers} '

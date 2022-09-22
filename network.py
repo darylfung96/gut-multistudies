@@ -465,18 +465,18 @@ class LightningAutoencoderCombineNetwork(pl.LightningModule):
         self.best_weights = None
 
         # generate scheduler for autoencoder and classification weights
-        all_epochs = np.arange(1, 100)
+        all_epochs = np.arange(1, 20)
         self.autoencoder_alpha = list(reversed([self._exp_decay(epoch) for epoch in all_epochs]))
         self.autoencoder_alpha = [1 - item for item in self.autoencoder_alpha]
 
     def _get_autoencoder_alpha(self):
-        if self.current_epoch >= 99:
+        if self.current_epoch >= 19:
             return 0
 
         return self.autoencoder_alpha[self.current_epoch]
 
     def _exp_decay(self, epoch):
-        if epoch >= 100:
+        if epoch >= 20:
             return 0
         initial_lrate = 1
         k = 0.1
@@ -610,9 +610,6 @@ class LightningAutoencoderCombineBENetwork(LightningAutoencoderCombineNetwork):
         optimizer = torch.optim.Adam(list(self.parameters()) + list(self.robust_loss.parameters()), lr=0.001)
         return optimizer
 
-    def _classification_loss(self):
-        ...
-
     def _reconstruction_loss(self):
         autoencoder_x, autoencoder_onehot_decoder_indexes, autoencoder_y = next(self.autoencoder_dataset)
         _, reconstructed_output = self.autoencoder_network(autoencoder_x)
@@ -640,7 +637,7 @@ class LightningAutoencoderCombineBENetwork(LightningAutoencoderCombineNetwork):
         onehot_output = torch.log_softmax(self.batch_network(encoded_output), 1)
         batch_loss = torch.clamp(-self.second_loss(onehot_output, onehot_decoder_indexes.argmax(1)), -1)
 
-        total_loss = total_loss + (1 - self._get_autoencoder_alpha()) * classification_loss + 0.01 * batch_loss
+        total_loss = total_loss + (1 - self._get_autoencoder_alpha()) * classification_loss + 0.1 * batch_loss
 
         if self.type == 'vqvae':
             loss, encode_features, persplexity, _ = encoded_output
@@ -699,7 +696,7 @@ class LightningAutoencoderCombineBEMMDNetwork(LightningAutoencoderCombineBENetwo
         encoded_output, _ = self.autoencoder_network(x)
 
         mmd_loss = self.mmd_loss(encoded_output, encoded_output)
-        total_loss = total_loss + 0.01 * mmd_loss
+        total_loss = total_loss + 0.1 * mmd_loss
 
         self.log('train_loss', total_loss)
         self.log('train_reconstruction_loss', reconstruction_loss)
@@ -1119,10 +1116,11 @@ class MultiAutoencoderNetwork(nn.Module):
 
 
 class AutoencoderNetwork(nn.Module):
-    def __init__(self, input_shape, output_shape, hidden_size, network_type='normal'):
+    def __init__(self, input_shape, output_shape, hidden_size, network_type='normal', loss=nn.BCELoss):
         super(AutoencoderNetwork, self).__init__()
         self.network_type = network_type
         self.hidden_size = hidden_size
+        self.criterion = loss
 
         self._initialize_network(input_shape, hidden_size)
 
@@ -1138,7 +1136,7 @@ class AutoencoderNetwork(nn.Module):
                    nn.Linear(2 * hidden_size, input_shape)]
         self.decoder = nn.Sequential(*decoder)
         # loss
-        self.loss = nn.BCELoss()
+        self.loss = self.criterion()
 
     def get_encoded_features(self, inputs):
         if self.network_type == 'vqvae':

@@ -8,12 +8,14 @@ from .prox import inplace_prox, inplace_group_prox, prox
 
 
 class LassoNet(nn.Module):
-    def __init__(self, *dims, groups=None, dropout=None):
+    def __init__(self, *dims, groups=None, dropout=None, is_batch_loss=None, condition_latent_size=None):
         """
         first dimension is input
         last dimension is output
         `groups` is a list of list such that `groups[i]`
         contains the indices of the features in the i-th group
+
+        If is_batch_loss is passed, need condition_latent_size so we can do inverse cross entropy on the number of studies
         """
         assert len(dims) > 2
         if groups is not None:
@@ -27,6 +29,7 @@ class LassoNet(nn.Module):
             ), f"Groups must be a partition of range(n_inputs={n_inputs})"
 
         self.groups = groups
+        self.is_batch_loss = is_batch_loss
 
         super().__init__()
 
@@ -35,6 +38,28 @@ class LassoNet(nn.Module):
             [nn.Linear(dims[i], dims[i + 1]) for i in range(len(dims) - 1)]
         )
         self.skip = nn.Linear(dims[0], dims[-1], bias=False)
+
+        if is_batch_loss:
+            assert condition_latent_size is not None, 'need to pass in condition_latent_size if is_batch_loss is passed'
+            self.batch_network = nn.Sequential(
+                nn.Linear(dims[-2], dims[-2]),
+                nn.ReLU(),
+                nn.Linear(dims[-2], dims[-2]),
+                nn.ReLU(),
+                nn.Linear(dims[-2], condition_latent_size)
+            )
+
+    def get_encoded_features(self, inp):
+        current_layer = inp
+        layer_features = []
+        for theta in self.layers:
+            current_layer = theta(current_layer)
+            if theta is not self.layers[-1]:
+                if self.dropout is not None:
+                    current_layer = self.dropout(current_layer)
+                current_layer = F.relu(current_layer)
+            layer_features.append(current_layer)
+        return layer_features
 
     def forward(self, inp):
         current_layer = inp
@@ -45,7 +70,21 @@ class LassoNet(nn.Module):
                 if self.dropout is not None:
                     current_layer = self.dropout(current_layer)
                 current_layer = F.relu(current_layer)
+
         return result + current_layer
+
+    def get_layer_features(self, inp):
+        features = inp
+        for layer in self.layers[:-2]:
+            features = layer(features)
+        return features
+
+    def forward_batch(self, inp):
+        features = inp
+        for layer in self.layers[:-2]:
+            features = layer(features)
+        onehot_output = self.batch_network(features)
+        return onehot_output
 
     def prox(self, *, lambda_, lambda_bar=0, M=1):
         if self.groups is None:
