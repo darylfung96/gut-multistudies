@@ -32,10 +32,10 @@ is_impute = False
 training_type = 'LODO'  # LODO / TOTA
 loss = 'ce'
 optim_name = 'adam'
-is_batch_loss = True
+is_batch_loss = 'mmd' # None, batch, mmd
 autoencoder_sizes = None  # (128, 128, 3)  # or None
 
-batch_loss_text = 'bl' if is_batch_loss else ''
+batch_loss_text = is_batch_loss
 
 if current_dataset == 'joined':
     data = pd.read_csv(f'raw_combined data/Joined_5_Plaque_{type_data}_level_OTUs_RA_with_disease_n_study.txt', sep='\t')

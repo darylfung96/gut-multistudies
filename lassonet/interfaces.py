@@ -24,6 +24,8 @@ from lassonet.model import LassoNet
 from lassonet.cox import CoxPHLoss, concordance_index
 from network import AutoencoderNetwork
 
+from mmd_loss import MMD_loss
+
 
 def abstractattr(f):
     return property(abstractmethod(f))
@@ -83,7 +85,7 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
         tie_approximation=None,
         loss='ce',
         autoencoder_sizes=None,
-        is_batch_loss=None,
+        is_batch_loss=None,  #  None, 'batch', 'mmd'
         condition_latent_size=None,
     ):
         """
@@ -210,8 +212,10 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
             )
 
         self.batch_criterion = None
-        if self.is_batch_loss:
+        if self.is_batch_loss == 'batch':
             self.batch_criterion = nn.NLLLoss()
+        elif self.is_batch_loss == 'mmd':
+            self.batch_criterion = MMD_loss()
 
         if self.class_weight is not None:
             assert isinstance(
@@ -403,10 +407,13 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
                         inverse_autoencoder_value = 1
                         current_X = X_train[batch]
 
-                    if self.is_batch_loss:
+                    if self.is_batch_loss == 'batch':
                         onehot_output = torch.log_softmax(model.forward_batch(current_X), 1)
-                        batch_loss = torch.clamp(-batch_criterion(onehot_output.cpu(), one_hot_train.argmax(1).cpu()), -12)
+                        batch_loss = torch.clamp(-batch_criterion(onehot_output.cpu(), one_hot_train.argmax(1).cpu()), -10)
                         # batch_loss = -batch_criterion(onehot_output, one_hot_train.argmax(1))
+                    elif self.is_batch_loss == 'mmd':
+                        encoded_output = model.get_layer_features(current_X)
+                        batch_loss = self.batch_criterion(encoded_output, encoded_output)
                     else:
                         batch_loss = 0
 
