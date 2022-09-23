@@ -405,7 +405,7 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
 
                     if self.is_batch_loss:
                         onehot_output = torch.log_softmax(model.forward_batch(current_X), 1)
-                        batch_loss = torch.clamp(-batch_criterion(onehot_output.cpu(), one_hot_train.argmax(1).cpu()), -10)
+                        batch_loss = torch.clamp(-batch_criterion(onehot_output.cpu(), one_hot_train.argmax(1).cpu()), -20)
                         # batch_loss = -batch_criterion(onehot_output, one_hot_train.argmax(1))
                     else:
                         batch_loss = 0
