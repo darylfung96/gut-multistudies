@@ -413,7 +413,9 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
                         # batch_loss = -batch_criterion(onehot_output, one_hot_train.argmax(1))
                     elif self.is_batch_loss == 'mmd':
                         encoded_output = model.get_layer_features(current_X)
-                        batch_loss = self.batch_criterion(encoded_output, encoded_output)
+                        # batch_loss = self.batch_criterion(encoded_output, encoded_output)
+                        random_idx = torch.randperm(encoded_output.shape[0])
+                        batch_loss = self.batch_criterion(encoded_output[random_idx], encoded_output)
                     else:
                         batch_loss = 0
 
