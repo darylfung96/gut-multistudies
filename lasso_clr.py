@@ -182,7 +182,7 @@ for idx, current_data in enumerate(all_data):
         # wandb.log({f'{unique_label} feature space': wandb.Image(plt)})
         # plt.clf()
         # plt.cla()
-        save_numpy_data(encoded_features.cpu(), np.array(data['Study_name']), unique_label)
+        save_numpy_data(encoded_features.cpu(), np.array(data['Study_name']), f'{unique_label}_{loss}_{optim_name}_{is_batch_loss}')
 
 
         n_selected = []
