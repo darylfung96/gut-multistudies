@@ -21,7 +21,7 @@ def save_numpy_data(numpy_data, numpy_labels, label):
 def load_numpy_data(label):
 	data_filename = os.path.join('tensorboard_visualization', label, 'numpy_data.npy')
 	label_filename = os.path.join('tensorboard_visualization', label, 'numpy_label.npy')
-	return np.load(data_filename), np.load(label_filename)
+	return np.load(data_filename, allow_pickle=True), np.load(label_filename, allow_pickle=True)
 
 
 def run_visualize_tsne_tensorboard(label):

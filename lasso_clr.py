@@ -33,7 +33,7 @@ is_impute = False
 training_type = 'LODO'  # LODO / TOTA
 loss = 'ce'  # ce / robust
 optim_name = 'adam'  # adam / ranger
-is_batch_loss = 'batch'  # None, batch, mmd
+is_batch_loss = None  # None, batch, mmd
 autoencoder_sizes = None  # (128, 128, 3)  # or None
 
 batch_loss_text = is_batch_loss
