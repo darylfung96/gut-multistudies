@@ -22,6 +22,7 @@ from ranger21 import Ranger21
 
 from training import leave_one_dataset_out, train_one_test_all
 from lassonet.interfaces import LassoNetClassifier
+from visualize_tsne_tensorboard import save_numpy_data
 
 wandb.login()
 torch.cuda.is_available()
@@ -30,9 +31,9 @@ current_dataset = 'plaque'  # joined or plaque or siamcat
 type_data = 'species'  # genus or species
 is_impute = False
 training_type = 'LODO'  # LODO / TOTA
-loss = 'ce'
-optim_name = 'adam'
-is_batch_loss = 'mmd'  # None, batch, mmd
+loss = 'ce'  # ce / robust
+optim_name = 'adam'  # adam / ranger
+is_batch_loss = 'batch'  # None, batch, mmd
 autoencoder_sizes = None  # (128, 128, 3)  # or None
 
 batch_loss_text = is_batch_loss
@@ -94,6 +95,7 @@ for label in np.unique(study_group_labels):
 plt.legend()
 plt.show()
 ###
+save_numpy_data(features, np.array(data['Study_name']), 'general')
 
 all_data = [features.astype(np.float32)]  # only get the values for batch correction
 
@@ -164,22 +166,24 @@ for idx, current_data in enumerate(all_data):
             encoded_features = lassonet.get_encoded_features(torch.from_numpy(current_data))
 
         # get encoded/batch features plot
-        pca = PCA(2)
-        tsne = TSNE(n_components=2, verbose=1, perplexity=40, n_iter=300)
-        latent_pca = pca.fit_transform(encoded_features.cpu())
-        latent_tsne = tsne.fit_transform(encoded_features.cpu())
-        study_group_labels = one_hot_decoder_indexes.argmax(1)
-        plt.clf()
-        for label in np.unique(study_group_labels):
-            indexes = np.where(study_group_labels == label)[0]
-            plt.xlabel('pca 1')
-            plt.ylabel('pca 2')
-            plt.scatter(latent_tsne[indexes, 0], latent_tsne[indexes, 1], s=latent_tsne[indexes, 0].shape[0],
-                        label=unique_labels[label], color=colors[label])
-        plt.legend()
-        wandb.log({f'{unique_label} feature space': wandb.Image(plt)})
-        plt.clf()
-        plt.cla()
+        # pca = PCA(2)
+        # tsne = TSNE(n_components=2, verbose=1, perplexity=40, n_iter=300)
+        # latent_pca = pca.fit_transform(encoded_features.cpu())
+        # latent_tsne = tsne.fit_transform(encoded_features.cpu())
+        # study_group_labels = one_hot_decoder_indexes.argmax(1)
+        # plt.clf()
+        # for label in np.unique(study_group_labels):
+        #     indexes = np.where(study_group_labels == label)[0]
+        #     plt.xlabel('pca 1')
+        #     plt.ylabel('pca 2')
+        #     plt.scatter(latent_tsne[indexes, 0], latent_tsne[indexes, 1], s=latent_tsne[indexes, 0].shape[0],
+        #                 label=unique_labels[label], color=colors[label])
+        # plt.legend()
+        # wandb.log({f'{unique_label} feature space': wandb.Image(plt)})
+        # plt.clf()
+        # plt.cla()
+        save_numpy_data(encoded_features.cpu(), np.array(data['Study_name']), unique_label)
+
 
         n_selected = []
         auc = []
