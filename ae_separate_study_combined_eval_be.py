@@ -1,4 +1,4 @@
-from combat.pycombat import pycombat
+# from combat.pycombat import pycombat
 import numpy as np
 import random
 import torch
@@ -31,7 +31,7 @@ elif current_dataset == 'plaque':
 else:
     raise Exception('Use either "joined" or "plaque" for current_dataset.')
 
-autoencoder_latent_shape = 20
+autoencoder_latent_shape = 64
 hidden_size = 256
 num_layers = 3
 
@@ -82,6 +82,10 @@ for idx, current_data in enumerate(all_data):
 
     # autoencoder_trainer.fit(autoencoder_network, dataloader)
 
+    best_table = []
+    f1_best_table = []
+    precision_best_table = []
+    recall_best_table = []
     for unique_label in unique_labels:
         wandb.init(name=f'wasif_data_separate_{unique_label} endend_bl_rb', project='wasif_data',
                    group=f'ae separate endend_bl_rb'
@@ -95,6 +99,7 @@ for idx, current_data in enumerate(all_data):
         np.random.seed(100)
         random.seed(100)
         torch.random.manual_seed(100)
+        torch.manual_seed(100)
         network = LightningAutoencoderCombineBENetwork(features.shape[1], encoded_labels.shape[1],
                                                      one_hot_decoder_indexes.shape[1], num_layers,
                                                      autoencoder_latent_shape, hidden_size,
@@ -156,6 +161,8 @@ for idx, current_data in enumerate(all_data):
 
         # get optimal threshold
         f1_score_list = []
+        precision_score_list = []
+        recall_score_list = []
         auc_list = []
         for i in range(encoded_labels.shape[1]):
             y_true = val_labels[:, i]
@@ -170,32 +177,41 @@ for idx, current_data in enumerate(all_data):
             preds[preds <= optimal_threshold] = 0
             wandb.log({'confusion_matrix': wandb.plot.confusion_matrix(preds=preds,
                                         y_true=y_true,
-                                        title="confusion matrix", class_names=label_encoder.get_feature_names())})
+                                        title="confusion matrix", class_names=label_encoder.get_feature_names_out())})
 
-            # f1 score
+            # scores
             f1_score = metrics.f1_score(y_true, preds)
+            precision_score = metrics.precision_score(y_true, preds)
+            recall_score = metrics.recall_score(y_true, preds)
             f1_score_list.append(f1_score)
+            precision_score_list.append(precision_score)
+            recall_score_list.append(recall_score)
 
             # area under curve
             auc = metrics.auc(fpr, tpr)
             auc_list.append(auc)
 
+
             table = wandb.Table(data=[[f"wasif_data",
                                        optimal_threshold]], columns=["runs",
-                                                                     f"optimal threshold {label_encoder.get_feature_names()[i]}"])
-            wandb.log({f"optimal_threshold_{label_encoder.get_feature_names()[i]}": wandb.plot.bar(table, "runs",
+                                                                     f"optimal threshold {label_encoder.get_feature_names_out()[i]}"])
+            wandb.log({f"optimal_threshold_{label_encoder.get_feature_names_out()[i]}": wandb.plot.bar(table, "runs",
                                                                                                    "optimal threshold",
-                                                                                          title=f"optimal threshold {label_encoder.get_feature_names()[i]}")})
+                                                                                          title=f"optimal threshold {label_encoder.get_feature_names_out()[i]}")})
 
-        # f1 score
+        # scores
         f1_score_average = sum(f1_score_list) / len(f1_score_list)
-        table = wandb.Table(data=[[f"wasif_data", f1_score_average]], columns=["runs", "f1 score"])
-        wandb.log({f"f1_score": wandb.plot.bar(table, "runs", "f1 score", title="f1 score")})
+        f1_best_table.append([unique_label, f1_score_average])
+
+        precision_score_average = sum(precision_score_list) / len(precision_score_list)
+        precision_best_table.append([unique_label, precision_score_average])
+
+        recall_score_average = sum(recall_score_list) / len(recall_score_list)
+        recall_best_table.append([unique_label, recall_score_average])
 
         # area under curve
         auc_average = sum(auc_list) / len(auc_list)
-        table = wandb.Table(data=[[f"wasif_data", auc_average]], columns=["runs", "auc"])
-        wandb.log({f"auc": wandb.plot.bar(table, "runs", "auc", title="auc")})
+        best_table.append([unique_label, auc_average])
 
         latent = network.get_encoded_features(torch.from_numpy(current_data)).detach().numpy()
         pca = PCA(2)
@@ -209,4 +225,15 @@ for idx, current_data in enumerate(all_data):
             plt.scatter(latent_pca[indexes, 0], latent_pca[indexes, 1], label=unique_labels[label], color=colors[label])
         plt.legend()
         plt.show()
+
+    wandb_best_table = wandb.Table(data=best_table, columns=['study', 'best auc'])
+    wandb.log({f"best_table": wandb.plot.bar(wandb_best_table, "runs", "best", title="best")})
+    wandb_best_f1_table = wandb.Table(data=f1_best_table, columns=['study', 'best f1'])
+    wandb.log({f"f1_best_table": wandb.plot.bar(wandb_best_f1_table, "runs", "best", title="best")})
+    wandb_best_precision_table = wandb.Table(data=precision_best_table,
+                                             columns=['study', 'best precision'])
+    wandb.log({f"precision_best_table": wandb.plot.bar(wandb_best_precision_table, "runs", "best", title="best")})
+    wandb_best_recall_table = wandb.Table(data=recall_best_table,
+                                          columns=['study', 'best recall'])
+    wandb.log({f"recall_best_table": wandb.plot.bar(wandb_best_recall_table, "runs", "best", title="best")})
 

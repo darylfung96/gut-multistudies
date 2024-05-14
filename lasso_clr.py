@@ -1,4 +1,4 @@
-from combat.pycombat import pycombat
+# from combat.pycombat import pycombat
 import numpy as np
 import random
 import torch
@@ -17,7 +17,8 @@ from mpl_toolkits import mplot3d
 import matplotlib.pyplot as plt
 import wandb
 import matplotlib
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, f1_score, precision_score, recall_score
+from sklearn.linear_model import Lasso, LogisticRegression
 from ranger21 import Ranger21
 
 from training import leave_one_dataset_out, train_one_test_all
@@ -31,12 +32,13 @@ current_dataset = 'plaque'  # joined or plaque or siamcat
 type_data = 'species'  # genus or species
 is_impute = False
 training_type = 'LODO'  # LODO / TOTA
-loss = 'ce'  # ce / robust
+loss = 'robust'  # ce / robust
 optim_name = 'adam'  # adam / ranger
-is_batch_loss = None  # None, batch, mmd
+is_batch_loss = True  # None, batch, mmd
 autoencoder_sizes = None  # (128, 128, 3)  # or None
+M=10
 
-batch_loss_text = is_batch_loss
+batch_loss_text = 'batch' if is_batch_loss else None
 
 if current_dataset == 'joined':
     data = pd.read_csv(f'raw_combined data/Joined_5_Plaque_{type_data}_level_OTUs_RA_with_disease_n_study.txt', sep='\t')
@@ -49,7 +51,7 @@ else:
     raise Exception('Use either "joined" or "plaque" for current_dataset.')
 
 
-autoencoder_latent_shape = 40
+autoencoder_latent_shape = 128
 hidden_size = 256
 num_layers = 3
 
@@ -77,6 +79,7 @@ one_hot_decoder_indexes = np.eye(np.max(decoder_indexes)+1)[decoder_indexes].ast
 features = data.values[:, 7:].astype(np.float32)  # 3 for siamcat, 7 for plaque
 feature_names = data.columns[7:]
 
+
 ###
 pca = PCA(2)
 tsne = TSNE(n_components=2, verbose=1, perplexity=40, n_iter=300)
@@ -84,6 +87,53 @@ latent_pca = pca.fit_transform(features)
 latent_tsne = tsne.fit_transform(features)
 study_group_labels = one_hot_decoder_indexes.argmax(1)
 plt.clf()
+
+unique_disease_status = np.unique(data['Disease_status'].values)
+
+disease_status_marker = {'CF': 'o', 'ECC': 'x'}
+# lassonet with batch loss and robust loss
+for disease_status in unique_disease_status:
+    status_indexes = np.where(data['Disease_status'] == disease_status)[0]
+    current_features = features[status_indexes]
+    current_study_group_labels = study_group_labels[status_indexes]
+    latent_pca = pca.fit_transform(current_features)
+
+    for label in np.unique(study_group_labels):
+        # current_data = data[['Prevotella_salivae', 'Streptococcus_mutans', 'Rothia_aeria', 'Lautropia_mirabilis', 'Corynebacterium_durum',
+        #       'Corynebacterium_matruchotii']]
+        # current_data = current_data.values
+        # latent_pca = pca.fit_transform(current_data)
+
+        indexes = np.where(current_study_group_labels == label)[0]
+        plt.xlabel('pca 1')
+        plt.ylabel('pca 2')
+        # ax.scatter3D(latent_pca[indexes, 0], latent_pca[indexes, 1], latent_pca[indexes, 2],
+        #              label=unique_labels[label], color=colors[label])
+        plt.scatter(latent_pca[indexes, 0], latent_pca[indexes, 1], s=latent_pca[indexes, 0].shape[0],
+                    label=unique_labels[label], color=colors[label], marker=disease_status_marker[disease_status])
+
+# plt.legend()
+plt.show()
+plt.clf()
+# lassonet
+for label in np.unique(study_group_labels):
+    current_data = data[['Streptococcus_mutans', 'Prevotella_salivae', 'Alloprevotella_sp._HMT_912',
+                         'Streptococcus_salivarius', 'Leptotrichia_goodfellowii', 'Rothia_aeria', 'Alloprevotella_sp._HMT_473']]
+    current_data = current_data.values
+    latent_pca = pca.fit_transform(current_data)
+
+    indexes = np.where(study_group_labels == label)[0]
+    plt.xlabel('pca 1')
+    plt.ylabel('pca 2')
+    # ax.scatter3D(latent_pca[indexes, 0], latent_pca[indexes, 1], latent_pca[indexes, 2],
+    #              label=unique_labels[label], color=colors[label])
+    plt.scatter(latent_pca[indexes, 0], latent_pca[indexes, 1], s=latent_pca[indexes, 0].shape[0],
+                label=unique_labels[label], color=colors[label])
+plt.legend()
+plt.show()
+plt.clf()
+
+
 # ax = plt.axes(projection ="3d")
 for label in np.unique(study_group_labels):
     indexes = np.where(study_group_labels == label)[0]
@@ -117,6 +167,9 @@ for idx, current_data in enumerate(all_data):
     # autoencoder_trainer.fit(autoencoder_network, dataloader)
     result_matrices = []
     best_table = []
+    f1_best_table = []
+    precision_best_table = []
+    recall_best_table = []
 
     for unique_label in unique_labels:
         wandb.init(name=f'WD_separate_{unique_label}_{training_type}_lassonet_clr_{batch_loss_text}_{loss}_{optim_name}', project='wasif_data',
@@ -124,20 +177,26 @@ for idx, current_data in enumerate(all_data):
                          f'{"impute" if is_impute else ""}'
                          f'num layers: {num_layers} '
                          f'latent:{autoencoder_latent_shape} '
+                         f'M: {M} '
                          f'hidden: {hidden_size}', reinit=True)
 
         # train autoencoder
         np.random.seed(100)
         random.seed(100)
         torch.random.manual_seed(100)
+        torch.manual_seed(100)
         if optim_name == 'adam':
             optim = None
         elif optim_name == 'ranger':
             ranger21_func = lambda *args, **kw: Ranger21(*args, **kw, lr=0.001, num_epochs=200, num_batches_per_epoch=5)
             optim = (ranger21_func, ranger21_func)
-        lassonet = LassoNetClassifier(hidden_dims=tuple([hidden_size] * num_layers), loss=loss, optim=optim,
-                                      autoencoder_sizes=autoencoder_sizes, is_batch_loss=is_batch_loss,
-                                      condition_latent_size=one_hot_decoder_indexes.shape[1])
+
+        if M != 0:
+            lassonet = LassoNetClassifier(hidden_dims=tuple([hidden_size] * num_layers), loss=loss, optim=optim,
+                                          autoencoder_sizes=autoencoder_sizes, is_batch_loss=is_batch_loss, M=M,
+                                          condition_latent_size=one_hot_decoder_indexes.shape[1])
+        else:
+            lassonet = LogisticRegression(penalty="l1", solver='saga')
 
 
         test_index = data.index[data['Study_name'] == unique_label].values
@@ -157,8 +216,27 @@ for idx, current_data in enumerate(all_data):
         val_labels = encoded_labels[test_index]
         val_tensor_encoded_labels = torch.from_numpy(val_labels)
 
+        # lasso regression
+        if M == 0:
+            lassonet.fit(train_features, train_labels.argmax(1))
+            # lassonet.predict(val_features)
+
+            y_pred = lassonet.predict(val_features)
+            current_auc = roc_auc_score(val_labels.argmax(1), y_pred)
+            current_f1 = f1_score(val_labels.argmax(1), y_pred)
+            current_precision = precision_score(val_labels.argmax(1), y_pred)
+            current_recall = recall_score(val_labels.argmax(1), y_pred)
+
+            best_table.append([unique_label, current_auc, 0])
+            f1_best_table.append([unique_label, current_f1, 0])
+            precision_best_table.append([unique_label, current_precision, 0])
+            recall_best_table.append([unique_label, current_recall, 0])
+            continue
+
+
         path = lassonet.path(train_features, train_labels.argmax(1),
-                             train_one_hot_decoder_indexes=torch.from_numpy(train_one_hot_decoder_indexes))
+                                 train_one_hot_decoder_indexes=torch.from_numpy(train_one_hot_decoder_indexes))
+
 
         # get batch features
         encoded_features = lassonet.get_layer_features(torch.from_numpy(current_data))
@@ -190,6 +268,9 @@ for idx, current_data in enumerate(all_data):
         lambda_ = []
         best_num_features = 0
         best_auc = 0
+        best_f1 = 0
+        best_precision = 0
+        best_recall = 0
         for save in path:
             lassonet.load(save.state_dict)
             y_pred = lassonet.predict(val_features)
@@ -199,11 +280,17 @@ for idx, current_data in enumerate(all_data):
             if current_auc > best_auc:
                 best_auc = current_auc
                 best_num_features = num_selected_features
+                best_f1 = f1_score(val_labels.argmax(1), y_pred.cpu().numpy())
+                best_precision = precision_score(val_labels.argmax(1), y_pred.cpu().numpy())
+                best_recall = recall_score(val_labels.argmax(1), y_pred.cpu().numpy())
 
             n_selected.append(num_selected_features)
             auc.append(current_auc)
             lambda_.append(save.lambda_)
         best_table.append([unique_label, best_auc, best_num_features])
+        f1_best_table.append([unique_label, best_f1, best_num_features])
+        precision_best_table.append([unique_label, best_precision, best_num_features])
+        recall_best_table.append([unique_label, best_recall, best_num_features])
 
         # plot number of selected features to auc
         fig = plt.figure(figsize=(12, 12))
@@ -216,6 +303,7 @@ for idx, current_data in enumerate(all_data):
         wandb.log({f'selected features vs auc': wandb.Image(plt)})
         plt.clf()
         plt.cla()
+        plt.close()
 
         # plot feature importances
         n_features = train_features.shape[1]
@@ -224,20 +312,27 @@ for idx, current_data in enumerate(all_data):
         importances = importances[order]
         ordered_feature_names = [feature_names[i] for i in order]
         color = np.array(["g"] * n_features)[order]
-        top_num = 100
+        top_num = 10
+
         plt.bar(
             np.arange(n_features)[:top_num],
             importances[:top_num],
             color=color,
         )
-        plt.xticks(np.arange(n_features)[:top_num], ordered_feature_names[:top_num], rotation=90)
+        plt.xticks(np.arange(n_features)[:top_num], ordered_feature_names[:top_num], rotation=45, ha='right',
+                   fontsize=15)
         # handles = [plt.Rectangle((0, 0), 1, 1, color=colors[label]) for label in labels]
         # plt.legend(handles, labels)
-        plt.ylabel("Feature importance")
-        plt.rcParams.update({'font.size': 8})
+        plt.ylabel("Feature importance", fontsize=15)
+        plt.yticks(fontsize=12)
+        plt.tight_layout()
+        plt.title(unique_label, fontsize=15)
+        plt.savefig(f"feature_importance_{unique_label}.png", dpi=600, bbox_inches='tight')
+
         wandb.log({f'feature importances {top_num}': wandb.Image(plt)})
         plt.clf()
         plt.cla()
+        plt.close()
         # plot top 50
         top_num = 50
         plt.rcParams.update({'font.size': 12})
@@ -253,9 +348,16 @@ for idx, current_data in enumerate(all_data):
         wandb.log({f'feature importances {top_num}': wandb.Image(plt)})
         plt.clf()
         plt.cla()
+        plt.close()
 
     wandb_best_table = wandb.Table(data=best_table, columns=['study', 'best auc', 'num of features'])
     wandb.log({f"best_table": wandb.plot.bar(wandb_best_table, "runs", "best", title="best")})
+    wandb_best_f1_table = wandb.Table(data=f1_best_table, columns=['study f1', 'best f1', 'num of features f1'])
+    wandb.log({f"f1_best_table": wandb.plot.bar(wandb_best_f1_table, "runs", "best", title="best")})
+    wandb_best_precision_table = wandb.Table(data=precision_best_table, columns=['study precision', 'best precision', 'num of features precision'])
+    wandb.log({f"precision_best_table": wandb.plot.bar(wandb_best_precision_table, "runs", "best", title="best")})
+    wandb_best_recall_table = wandb.Table(data=recall_best_table, columns=['study recall', 'best recall', 'num of features recall'])
+    wandb.log({f"recall_best_table": wandb.plot.bar(wandb_best_recall_table, "runs", "best", title="best")})
 
     # if training_type == 'LODO':
         #     result_matrix = leave_one_dataset_out(network, data, current_data, label_encoder, encoded_labels, one_hot_decoder_indexes,

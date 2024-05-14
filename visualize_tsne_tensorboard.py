@@ -3,9 +3,9 @@ import os
 import tensorflow as tf
 # from tensorflow.contrib.tensorboard.plugins import projector
 import numpy as np
-import pandas as pd
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
+# import umap
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
 
 
 def save_numpy_data(numpy_data, numpy_labels, label):
@@ -54,3 +54,30 @@ def run_visualize_tsne_tensorboard(label):
 		embedding.metadata_path = 'df_labels.tsv'
 		# Saves a config file that TensorBoard will read during startup.
 		projector.visualize_embeddings(tf.summary.FileWriter(LOG_DIR), config)
+
+
+def run_umap_visualization(label):
+	if 'batch' in label :
+		return
+	colors = ['r', 'g', 'm', 'k', 'y']
+	numpy_data, numpy_labels = load_numpy_data(label)
+
+	reducer = TSNE(perplexity=80, n_iter=1000, learning_rate='auto')#umap.UMAP(n_neighbors=15, n_epochs=250)
+	# reducer = umap.UMAP(n_neighbors=15, n_epochs=500)
+	embeddings = reducer.fit_transform(numpy_data)
+
+	unique_labels = np.unique(numpy_labels)
+
+	for label_index, unique_label in enumerate(unique_labels):
+		indexes = np.where(numpy_labels == unique_label)[0]
+		plt.scatter(embeddings[indexes, 0], embeddings[indexes, 1], label=unique_label, color=colors[label_index])
+	plt.legend()
+	plt.title(label)
+	plt.show()
+
+
+if __name__ == '__main__':
+	labels = os.listdir('tensorboard_visualization')
+	for label in labels:
+		run_umap_visualization(label)
+

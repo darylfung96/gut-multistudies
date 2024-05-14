@@ -356,7 +356,6 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
                     current_X = X_val
 
                 return (
-                    torch.mean(self.criterion(model(current_X).cpu(), onehot_yval)).item()
                     + lambda_ * model.l1_regularization_skip().item()
                     + self.gamma * model.l2_regularization().item()
                     + self.gamma_skip * model.l2_regularization_skip().item()
@@ -717,6 +716,9 @@ class LassoNetClassifier(
 
     def get_layer_features(self, X):
         with torch.no_grad():
+            if self.autoencoder_sizes:
+                X, _ = self.autoencoder_model(X)
+
             features = self.model.get_layer_features(self._cast_input(X))
         return features
 
@@ -906,3 +908,12 @@ def lassonet_path(X, y, task, *, X_val=None, y_val=None, **kwargs):
         raise ValueError('task must be "classification," "regression," or "cox')
     model = class_(**kwargs)
     return model.path(X, y, X_val=X_val, y_val=y_val)
+
+
+
+
+['Streptococcus_mutans', 'Cardiobacterium_hominis', 'Prevotella_salivae', 'Streptococcus_salivarius', 'Lautropia_mirabilis',
+'Streptococcus_mutans', 'Prevotella_salivae', 'Rothia_aeria', 'Corynebacterium_durum', 'Alloprevotella_sp._HMT_308',
+'Rothia_aeria', 'Megasphaera_micronuciformis', 'Lachnoanaerobaculum_umeaense', 'Lautropia_mirabilis', 'Corynebacterium_matruchotii',
+'Rothia_aeria', 'Corynebacterium_durum', 'Streptococcus_mutans', 'Kingella_oralis', 'Prevotella_salivae',
+'Abiotrophia_defectiva', 'Corynebacterium_matruchotii', 'Streptococcus_sobrinus', 'Prevotella_salivae', 'Capnocytophaga_sputigena']
